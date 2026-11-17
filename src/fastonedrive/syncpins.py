@@ -1,0 +1,1286 @@
+import os
+from collections.abc import Callable
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from shutil import copy2
+from typing import Any
+
+from fastonedrive import FastOneDriveError
+from fastonedrive import config
+from fastonedrive.activity import setActivity
+from fastonedrive.disk import (
+	assertFreeSpace,
+	evictCache,
+	isEphemeralName,
+	isEphemeralPath,
+	isStagingRel,
+	pathPresent,
+	pinsLock,
+	tryExclusiveWriteGuard,
+	writeGuardHeld,
+	pruneJobArtifacts,
+	suppressPath,
+)
+from fastonedrive.chunks import deleteChunkRow, fillHoles, isPartial
+from fastonedrive.hydrate import (
+	_dirtyCacheBeside,
+	adoptDownloadedFile,
+	isCacheDirty,
+	isDirtyCacheFile,
+)
+from fastonedrive.index import (
+	SYNC_DIRTY,
+	SYNC_ERROR,
+	SYNC_SYNCING,
+	deleteIndexTree,
+	clearItemBaseline,
+	getEntry,
+	listDirtyPaths,
+	listPinned,
+	markDirty,
+	parentPath,
+	setPinned,
+	setSyncState,
+	upsertEntry,
+	upsertPinned,
+)
+from fastonedrive.notify import notifyDirChanged
+from fastonedrive.pin import pinPathBlocked
+from fastonedrive.rclone import (
+	contentTokenFromStat,
+	copyFromLocal,
+	copyToReplace,
+	deleteRemoteFile,
+	hashLocalQuickXor,
+	isContentToken,
+	iterLsjson,
+	parseRemoteModTime,
+	quickXorEqual,
+	remoteSizeBytes,
+	mkdirRemote,
+	remoteStat,
+	statSize,
+	rmdirRemote,
+	tokenKind,
+	tokensDiffer,
+)
+from fastonedrive.search import cacheLocalPath, pinnedLocalPath
+
+MTIME_SKEW: timedelta = timedelta(seconds=2)
+_dirtyRedirects: set[str] = set()
+
+
+def syncPins(
+	onStats: Callable[[str], None] | None = None,
+	itemPath: str | None = None,
+) -> dict[str, int]:
+	with pinsLock():
+		return _syncPins(onStats, itemPath)
+
+
+def _syncPins(
+	onStats: Callable[[str], None] | None,
+	itemPath: str | None,
+) -> dict[str, int]:
+	return _syncPinsLocked(onStats, itemPath)
+
+
+def _syncPinsLocked(
+	onStats: Callable[[str], None] | None,
+	itemPath: str | None,
+) -> dict[str, int]:
+	pruneJobArtifacts(config.ensureCacheDir(), includePartials=True, recursive=True)
+	stats: dict[str, int] = {
+		"downloaded": 0,
+		"uploaded": 0,
+		"deletedLocal": 0,
+		"deletedRemote": 0,
+		"skipped": 0,
+		"conflicts": 0,
+		"errors": 0,
+	}
+	target: str = (itemPath or "").strip().strip("/")
+	if target != "" and isEphemeralPath(target):
+		return stats
+	setActivity("syncing", target if target != "" else "pins")
+	pendingDirs: list[str] = []
+	try:
+		if target != "":
+			_syncOnePath(target, stats, onStats, pendingDirs)
+			_syncDirtyCache(stats, onStats, target)
+		else:
+			_syncPinnedRows(stats, onStats, pendingDirs)
+			_syncDirtyDirectories(stats)
+			_syncDirtyCache(stats, onStats, None)
+		_flushPendingRmdirs(pendingDirs, stats)
+		setActivity("idle", "")
+	except Exception as error:
+		setActivity("error", str(error))
+		raise
+	return stats
+
+
+def _syncPinnedRows(
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	for row in listPinned():
+		path: str = str(row["path"])
+		if isEphemeralPath(path):
+			continue
+		blocked: str | None = pinPathBlocked(path)
+		if blocked is not None:
+			continue
+		_syncOnePath(path, stats, onStats, pendingDirs)
+
+
+def _syncOnePath(
+	itemPath: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	entry = getEntry(itemPath)
+	if entry is not None and bool(entry["isDir"]):
+		pinnedHere: bool = bool(entry["pinned"])
+		state: str = str(entry["syncState"] or "")
+		if state == SYNC_DIRTY and not _publishDirtyDirectory(itemPath, stats):
+			return
+		_syncDirtyUnder(itemPath, stats, onStats, pendingDirs)
+		if not pinnedHere and not pinnedLocalPath(itemPath).is_dir():
+			return
+		_syncPinnedDirectory(itemPath, stats, onStats, pendingDirs)
+		return
+	_ensurePinnedCopy(itemPath, stats)
+	kind: str
+	local: Path | None
+	kind, local = _intactLocal(itemPath, stats)
+	if kind == "blocked":
+		return
+	remotePath: str = config.remotePath(itemPath)
+	try:
+		stat = remoteStat(remotePath)
+	except FastOneDriveError:
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, "stat remoto falhou")
+		return
+	remoteExists: bool = stat is not None
+	if kind == "download":
+		if remoteExists:
+			_downloadRemote(
+				itemPath,
+				pinnedLocalPath(itemPath),
+				stats,
+				onStats,
+			)
+			return
+		stats["skipped"] += 1
+		return
+	localExists: bool = local is not None and local.is_file()
+	if localExists and remoteExists:
+		assert stat is not None and local is not None
+		baseEtag: str = str(entry["baseEtag"] or "") if entry is not None else ""
+		if entry is None or baseEtag == "":
+			_resolveBothExist(itemPath, local, stat, stats, onStats)
+			return
+		rowPinned: bool = entry is not None and bool(entry["pinned"])
+		if not rowPinned and not pinnedLocalPath(itemPath).is_file() and isCacheDirty(itemPath):
+			_uploadLocal(itemPath, local, stats, onStats)
+			return
+		_resolveBothExist(itemPath, local, stat, stats, onStats)
+		return
+	if remoteExists and not localExists:
+		_resolveRemoteOnly(itemPath, stats, onStats, pendingDirs)
+		return
+	if localExists and not remoteExists:
+		assert local is not None
+		_resolveLocalOnly(itemPath, local, stats, onStats)
+		return
+	stats["skipped"] += 1
+
+
+def _publishDirtyDirectory(itemPath: str, stats: dict[str, int]) -> bool:
+	try:
+		mkdirRemote(config.remotePath(itemPath))
+	except FastOneDriveError as error:
+		if not _remoteDirExists(itemPath):
+			stats["errors"] += 1
+			setSyncState(itemPath, SYNC_ERROR, str(error))
+			return False
+	setSyncState(itemPath, "")
+	notifyDirChanged(itemPath)
+	return True
+
+
+def _remoteDirExists(itemPath: str) -> bool:
+	try:
+		stat: dict[str, Any] | None = remoteStat(config.remotePath(itemPath))
+	except FastOneDriveError:
+		return False
+	return stat is not None and bool(stat.get("IsDir"))
+
+
+def _syncDirtyDirectories(stats: dict[str, int]) -> None:
+	itemPath: str
+	for itemPath in listDirtyPaths(""):
+		entry = getEntry(itemPath)
+		if entry is None or not bool(entry["isDir"]):
+			continue
+		if str(entry["syncState"] or "") != SYNC_DIRTY:
+			continue
+		_publishDirtyDirectory(itemPath, stats)
+
+
+def _syncDirtyUnder(
+	root: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	itemPath: str
+	for itemPath in listDirtyPaths(root):
+		entry = getEntry(itemPath)
+		if entry is None:
+			continue
+		if bool(entry["isDir"]):
+			if str(entry["syncState"] or "") == SYNC_DIRTY:
+				_publishDirtyDirectory(itemPath, stats)
+			continue
+		_syncOnePath(itemPath, stats, onStats, pendingDirs)
+
+
+def _syncPinnedDirectory(
+	itemPath: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	target: Path = pinnedLocalPath(itemPath)
+	if not target.is_dir():
+		_syncMissingPinnedDirectory(
+			itemPath,
+			target,
+			stats,
+			onStats,
+			pendingDirs,
+		)
+		return
+	remotePath: str = config.remotePath(itemPath)
+	try:
+		_applyRemoteListing(
+			itemPath,
+			remotePath,
+			stats,
+			onStats,
+			pendingDirs,
+		)
+	except FastOneDriveError:
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, "listagem remota falhou")
+
+
+def _listedRemoteIsFile(remotePath: str, itemPath: str, items: list[dict[str, Any]]) -> bool:
+	name: str = itemPath.rsplit("/", 1)[-1]
+	if name == "" or len(items) != 1:
+		return False
+	item: dict[str, Any] = items[0]
+	if bool(item.get("IsDir")) or str(item.get("Name") or "") != name:
+		return False
+	stat: dict[str, Any] | None = remoteStat(remotePath)
+	return stat is not None and not bool(stat.get("IsDir"))
+
+
+def _applyRemoteListing(
+	itemPath: str,
+	remotePath: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	raw: list[dict[str, Any]] = list(
+		iterLsjson(remotePath, recursive=False, maxDepth=1)
+	)
+	if _listedRemoteIsFile(remotePath, itemPath, raw):
+		return
+	seen: set[str] = set()
+	for item in raw:
+		name: str = str(item.get("Name") or "")
+		if name == "" or isEphemeralName(name):
+			continue
+		child: str = f"{itemPath}/{name}"
+		seen.add(child)
+		if pinPathBlocked(child) is not None:
+			continue
+		isDir: bool = bool(item.get("IsDir"))
+		_keepPinnedChild(child, name, isDir, int(item.get("Size") or 0))
+		if isDir:
+			pinnedLocalPath(child).mkdir(parents=True, exist_ok=True)
+			_syncPinnedDirectory(child, stats, onStats, pendingDirs)
+			continue
+		_syncOnePath(child, stats, onStats, pendingDirs)
+	localRoot: Path = pinnedLocalPath(itemPath)
+	if not localRoot.is_dir():
+		return
+	for childPath in localRoot.iterdir():
+		if childPath.name in ("", ".", "..") or isEphemeralName(childPath.name):
+			continue
+		rel: str = f"{itemPath}/{childPath.name}"
+		if rel in seen:
+			continue
+		if childPath.is_file():
+			_syncOnePath(rel, stats, onStats, pendingDirs)
+
+
+def _syncMissingPinnedDirectory(
+	itemPath: str,
+	target: Path,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	entry = getEntry(itemPath)
+	baseEtag: str = str(entry["baseEtag"] or "") if entry is not None else ""
+	if not isContentToken(baseEtag):
+		target.mkdir(parents=True, exist_ok=True)
+		_downloadPinnedChildren(itemPath, stats, onStats)
+		return
+	_resolveRemoteOnly(itemPath, stats, onStats, pendingDirs)
+
+
+def _downloadPinnedChildren(
+	itemPath: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	remotePath: str = config.remotePath(itemPath)
+	try:
+		raw: list[dict[str, Any]] = list(
+			iterLsjson(remotePath, recursive=False, maxDepth=1)
+		)
+		if _listedRemoteIsFile(remotePath, itemPath, raw):
+			return
+		for item in raw:
+			name: str = str(item.get("Name") or "")
+			if name in ("", ".", "..") or isEphemeralName(name):
+				continue
+			child: str = f"{itemPath}/{name}"
+			if child == itemPath or pinPathBlocked(child) is not None:
+				continue
+			if bool(item.get("IsDir")):
+				pinnedLocalPath(child).mkdir(parents=True, exist_ok=True)
+				upsertPinned(child, True, name, True, 0)
+				_downloadPinnedChildren(child, stats, onStats)
+				continue
+			if _preferDirtyCache(child, stats, onStats):
+				continue
+			_downloadRemote(
+				child,
+				pinnedLocalPath(child),
+				stats,
+				onStats,
+			)
+	except FastOneDriveError:
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, "listagem remota falhou")
+
+
+def _preferDirtyCache(
+	itemPath: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> bool:
+	if itemPath in _dirtyRedirects or not isCacheDirty(itemPath):
+		return False
+	if writeGuardHeld(itemPath):
+		return True
+	_dirtyRedirects.add(itemPath)
+	try:
+		promoted: tuple[str, Path | None] = _promoteDirtyCache(itemPath, stats)
+		if promoted[0] == "blocked":
+			return True
+		if promoted[0] != "file":
+			return False
+		_syncOnePath(itemPath, stats, onStats, [])
+		return True
+	finally:
+		_dirtyRedirects.discard(itemPath)
+
+
+def _promoteDirtyCache(
+	itemPath: str,
+	stats: dict[str, int],
+) -> tuple[str, Path | None]:
+	with tryExclusiveWriteGuard(itemPath) as held:
+		if not held:
+			return "blocked", None
+		cached: Path = cacheLocalPath(itemPath)
+		if not cached.is_file() or not isCacheDirty(itemPath):
+			return "skip", None
+		if isPartial(itemPath) and not _ensureFilled(itemPath, cached):
+			stats["errors"] += 1
+			return "blocked", None
+		if not cached.is_file():
+			return "skip", None
+		target: Path = pinnedLocalPath(itemPath)
+		if target.is_dir():
+			return "file", cached
+		target.parent.mkdir(parents=True, exist_ok=True)
+		sameFile: bool = False
+		try:
+			sameFile = cached.resolve() == target.resolve()
+		except OSError:
+			sameFile = False
+		if not sameFile:
+			copy2(cached, target)
+			if not target.is_file():
+				stats["errors"] += 1
+				return "blocked", None
+			cached.unlink(missing_ok=True)
+		if not target.is_file():
+			stats["errors"] += 1
+			return "blocked", None
+		return "file", target
+
+
+def _mtMatchesLocal(local: Path, remoteToken: str) -> bool:
+	body: str = remoteToken[3:]
+	epochText: str
+	sizeText: str
+	epochText, sep, sizeText = body.partition(":")
+	if sep == "" or epochText == "" or sizeText == "":
+		return False
+	try:
+		remoteWhen: datetime = datetime.fromtimestamp(int(epochText), tz=timezone.utc)
+		remoteSize: int = int(sizeText)
+	except ValueError:
+		return False
+	localWhen: datetime = datetime.fromtimestamp(local.stat().st_mtime, tz=timezone.utc)
+	localSize: int = int(local.stat().st_size)
+	if localSize != remoteSize:
+		return False
+	return abs((localWhen - remoteWhen).total_seconds()) <= MTIME_SKEW.total_seconds()
+
+
+def _baselineNeedsHash(baseEtag: str) -> bool:
+	return baseEtag.startswith("migrated:") or baseEtag.startswith("mt:")
+
+
+def _resolveHashedBaseline(
+	itemPath: str,
+	local: Path,
+	stat: dict[str, object],
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	if not _readyToHash(itemPath, local, stats):
+		return
+	localToken: str = ""
+	try:
+		localToken = hashLocalQuickXor(local)
+	except FastOneDriveError:
+		localToken = ""
+	remoteToken: str = contentTokenFromStat(stat)
+	matched: bool | None = quickXorEqual(localToken, remoteToken)
+	if matched is True:
+		adoptDownloadedFile(itemPath, local, stat)
+		stats["skipped"] += 1
+		return
+	if matched is False:
+		_writeConflict(
+			itemPath,
+			local,
+			stat,
+			stats,
+			onStats,
+		)
+		return
+	entry = getEntry(itemPath)
+	baseEtag: str = str(entry["baseEtag"] or "") if entry is not None else ""
+	if baseEtag == "" and tokenKind(remoteToken) == "mt":
+		if _mtMatchesLocal(local, remoteToken):
+			adoptDownloadedFile(itemPath, local, stat)
+			stats["skipped"] += 1
+			return
+		_writeConflict(
+			itemPath,
+			local,
+			stat,
+			stats,
+			onStats,
+		)
+		return
+	if baseEtag == "":
+		_writeConflict(
+			itemPath,
+			local,
+			stat,
+			stats,
+			onStats,
+		)
+		return
+	baseTime: datetime | None = None
+	if entry is not None:
+		baseTime = parseRemoteModTime(str(entry["baseModTime"] or ""))
+	localTime: datetime = datetime.fromtimestamp(local.stat().st_mtime, tz=timezone.utc)
+	remoteTime: datetime | None = parseRemoteModTime(str(stat.get("ModTime") or ""))
+	localNewer: bool = baseTime is None or localTime > baseTime + MTIME_SKEW
+	if localNewer or remoteTime is None:
+		_writeConflict(
+			itemPath,
+			local,
+			stat,
+			stats,
+			onStats,
+		)
+		return
+	if abs((localTime - remoteTime).total_seconds()) <= MTIME_SKEW.total_seconds():
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, "não foi possível comparar o conteúdo")
+		return
+	_writeConflict(
+		itemPath,
+		local,
+		stat,
+		stats,
+		onStats,
+	)
+
+
+def _ensurePinnedCopy(itemPath: str, stats: dict[str, int]) -> None:
+	entry = getEntry(itemPath)
+	if entry is None or not bool(entry["pinned"]) or bool(entry["isDir"]):
+		return
+	pinFile: Path = pinnedLocalPath(itemPath)
+	if pathPresent(pinFile):
+		return
+	cached: Path = cacheLocalPath(itemPath)
+	if cached.is_file() and not isPartial(itemPath) and not isCacheDirty(itemPath):
+		copied: tuple[str, Path | None] | None = _materializePinFromCache(
+			itemPath,
+			pinFile,
+			cached,
+			True,
+			stats,
+		)
+		if pinFile.is_file():
+			return
+		if copied is not None and copied[0] == "blocked":
+			return
+	if pathPresent(pinFile) or pathPresent(cached):
+		return
+	clearItemBaseline(itemPath)
+
+
+def _keepPinnedChild(child: str, name: str, isDir: bool, size: int) -> None:
+	if pinPathBlocked(child) is not None:
+		return
+	entry = getEntry(child)
+	if entry is not None and bool(entry["pinned"]):
+		if not isDir:
+			_ensurePinnedCopy(child, {"errors": 0})
+		return
+	upsertPinned(child, True, name, isDir, size)
+	if entry is None or isDir:
+		return
+	if pathPresent(pinnedLocalPath(child)):
+		return
+	clearItemBaseline(child)
+
+
+def _baselineEquivalent(
+	baseEtag: str,
+	remoteEtag: str,
+	baseTime: datetime | None,
+	remoteTime: datetime | None,
+	baseSize: int | None,
+	remoteSize: int | None,
+) -> bool:
+	if baseEtag == "" or remoteEtag == "" or baseEtag.startswith("migrated:"):
+		return False
+	return not tokensDiffer(
+		baseEtag,
+		remoteEtag,
+		baseTime,
+		remoteTime,
+		baseSize,
+		remoteSize,
+	)
+
+
+def _deleteEquivalentRemote(
+	itemPath: str,
+	entry: object,
+	stats: dict[str, int],
+	pendingDirs: list[str],
+) -> None:
+	isDir: bool = False
+	if entry is not None:
+		try:
+			isDir = bool(entry["isDir"])  # type: ignore[index]
+		except (IndexError, KeyError, TypeError):
+			isDir = False
+	if isDir:
+		pendingDirs.append(itemPath)
+		return
+	try:
+		deleteRemoteFile(config.remotePath(itemPath))
+	except FastOneDriveError as error:
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, str(error))
+		return
+	deleteIndexTree(itemPath)
+	stats["deletedRemote"] += 1
+	notifyDirChanged(parentPath(itemPath))
+
+
+def _flushPendingRmdirs(pendingDirs: list[str], stats: dict[str, int]) -> None:
+	ordered: list[str] = sorted(
+		set(pendingDirs),
+		key=lambda itemPath: (itemPath.count("/"), len(itemPath)),
+		reverse=True,
+	)
+	itemPath: str
+	for itemPath in ordered:
+		_rmdirDeferred(itemPath, stats)
+
+
+def _rmdirDeferred(itemPath: str, stats: dict[str, int]) -> None:
+	remotePath: str = config.remotePath(itemPath)
+	try:
+		stat: dict[str, object] | None = remoteStat(remotePath)
+	except FastOneDriveError as error:
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, str(error))
+		return
+	if stat is None:
+		_dropRemovedDir(itemPath, stats)
+		return
+	try:
+		rmdirRemote(remotePath)
+	except FastOneDriveError:
+		try:
+			still: dict[str, object] | None = remoteStat(remotePath)
+		except FastOneDriveError as error:
+			stats["errors"] += 1
+			setSyncState(itemPath, SYNC_ERROR, str(error))
+			return
+		if still is None:
+			_dropRemovedDir(itemPath, stats)
+			return
+		stats["skipped"] += 1
+		return
+	_dropRemovedDir(itemPath, stats)
+
+
+def _dropRemovedDir(itemPath: str, stats: dict[str, int]) -> None:
+	deleteIndexTree(itemPath)
+	stats["deletedRemote"] += 1
+	notifyDirChanged(parentPath(itemPath))
+
+
+def _resolveBothExist(
+	itemPath: str,
+	local: Path,
+	stat: dict[str, object],
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	entry = getEntry(itemPath)
+	remoteTime: datetime | None = parseRemoteModTime(str(stat.get("ModTime") or ""))
+	remoteEtag: str = contentTokenFromStat(stat)
+	localTime: datetime = datetime.fromtimestamp(local.stat().st_mtime, tz=timezone.utc)
+	baseTime: datetime | None = None
+	baseEtag: str = ""
+	if entry is not None:
+		baseTime = parseRemoteModTime(str(entry["baseModTime"] or ""))
+		baseEtag = str(entry["baseEtag"] or "")
+	if baseEtag == "" or _baselineNeedsHash(baseEtag):
+		_resolveHashedBaseline(
+			itemPath,
+			local,
+			stat,
+			stats,
+			onStats,
+		)
+		return
+	if not isContentToken(baseEtag):
+		_adoptOrSend(
+			itemPath,
+			local,
+			stat,
+			remoteTime,
+			localTime,
+			entry,
+			stats,
+			onStats,
+		)
+		return
+	localChanged: bool = _localChanged(localTime, baseTime, entry)
+	remoteSize: int | None = statSize(stat)
+	baseSize: int | None = int(entry["size"]) if entry is not None else None
+	remoteChanged: bool = _remoteChanged(
+		remoteEtag,
+		baseEtag,
+		remoteTime,
+		baseTime,
+		remoteSize,
+		baseSize,
+	)
+	if localChanged and remoteChanged:
+		_writeConflict(itemPath, local, stat, stats, onStats)
+		return
+	if localChanged:
+		_uploadLocal(itemPath, local, stats, onStats)
+		return
+	if remoteChanged:
+		_downloadRemote(itemPath, local, stats, onStats)
+		return
+	stats["skipped"] += 1
+
+
+def _resolveRemoteOnly(
+	itemPath: str,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	pendingDirs: list[str],
+) -> None:
+	entry = getEntry(itemPath)
+	pinned: bool = entry is not None and bool(entry["pinned"])
+	if not pinned:
+		stats["skipped"] += 1
+		return
+	baseEtag: str = str(entry["baseEtag"] or "") if entry is not None else ""
+	if baseEtag == "":
+		target: Path = pinnedLocalPath(itemPath)
+		_downloadRemote(itemPath, target, stats, onStats)
+		return
+	try:
+		stat = remoteStat(config.remotePath(itemPath))
+	except FastOneDriveError:
+		stats["errors"] += 1
+		setSyncState(itemPath, SYNC_ERROR, "stat remoto falhou")
+		return
+	remoteEtag: str = contentTokenFromStat(stat) if stat is not None else ""
+	remoteTime: datetime | None = None
+	remoteSize: int | None = None
+	if stat is not None:
+		remoteTime = parseRemoteModTime(str(stat.get("ModTime") or ""))
+		remoteSize = statSize(stat)
+	baseTime: datetime | None = None
+	baseSize: int | None = None
+	if entry is not None:
+		baseTime = parseRemoteModTime(str(entry["baseModTime"] or ""))
+		baseSize = int(entry["size"])
+	if _baselineEquivalent(
+		baseEtag,
+		remoteEtag,
+		baseTime,
+		remoteTime,
+		baseSize,
+		remoteSize,
+	):
+		_deleteEquivalentRemote(itemPath, entry, stats, pendingDirs)
+		return
+	setPinned(itemPath, False)
+	stats["skipped"] += 1
+
+
+def _resolveLocalOnly(
+	itemPath: str,
+	local: Path,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	entry = getEntry(itemPath)
+	baseEtag: str = str(entry["baseEtag"] or "") if entry is not None else ""
+	if entry is None or baseEtag == "":
+		_uploadLocal(itemPath, local, stats, onStats)
+		return
+	baseTime: datetime | None = parseRemoteModTime(str(entry["baseModTime"] or ""))
+	localTime: datetime = datetime.fromtimestamp(local.stat().st_mtime, tz=timezone.utc)
+	localChanged: bool = _localChanged(localTime, baseTime, entry)
+	if localChanged:
+		_uploadLocal(itemPath, local, stats, onStats)
+		return
+	_removeLocalCopies(itemPath, local)
+	deleteIndexTree(itemPath)
+	stats["deletedLocal"] += 1
+
+
+def _localChanged(
+	localTime: datetime,
+	baseTime: datetime | None,
+	entry: object,
+) -> bool:
+	if entry is not None:
+		try:
+			state: str = str(entry["syncState"] or "")  # type: ignore[index]
+		except (IndexError, KeyError, TypeError):
+			state = ""
+		if state in ("dirty", "syncing", "conflict", "error"):
+			return True
+	if baseTime is None:
+		return True
+	return localTime > baseTime + MTIME_SKEW
+
+
+def _adoptOrSend(
+	itemPath: str,
+	local: Path,
+	stat: dict[str, object],
+	remoteTime: datetime | None,
+	localTime: datetime,
+	entry: object,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	state: str = ""
+	if entry is not None:
+		try:
+			state = str(entry["syncState"] or "")  # type: ignore[index]
+		except (IndexError, KeyError, TypeError):
+			state = ""
+	remoteSize: int | None = statSize(stat)
+	localSize: int = int(local.stat().st_size)
+	localToken: str = ""
+	try:
+		localToken = hashLocalQuickXor(local)
+	except FastOneDriveError:
+		localToken = ""
+	remoteToken: str = contentTokenFromStat(stat)
+	if _sameBytes(
+		localToken,
+		remoteToken,
+		localTime,
+		remoteTime,
+		localSize,
+		remoteSize,
+	):
+		adoptDownloadedFile(itemPath, local, stat)
+		stats["skipped"] += 1
+		return
+	localEdited: bool = state in ("dirty", "syncing", "conflict", "error") or (
+		remoteTime is not None and localTime > remoteTime + MTIME_SKEW
+	)
+	if localEdited:
+		_writeConflict(
+			itemPath,
+			local,
+			stat,
+			stats,
+			onStats,
+		)
+		return
+	_downloadRemote(
+		itemPath,
+		local,
+		stats,
+		onStats,
+	)
+
+
+def _sameBytes(
+	localToken: str,
+	remoteToken: str,
+	localTime: datetime,
+	remoteTime: datetime | None,
+	localSize: int | None,
+	remoteSize: int | None,
+) -> bool:
+	localKind: str = tokenKind(localToken)
+	remoteKind: str = tokenKind(remoteToken)
+	if localKind != "" and localKind == remoteKind:
+		return localToken == remoteToken
+	if remoteTime is None:
+		return False
+	if abs((localTime - remoteTime).total_seconds()) > MTIME_SKEW.total_seconds():
+		return False
+	if localSize is None or remoteSize is None:
+		return False
+	return localSize == remoteSize
+
+
+def _remoteChanged(
+	remoteEtag: str,
+	baseEtag: str,
+	remoteTime: datetime | None,
+	baseTime: datetime | None,
+	remoteSize: int | None,
+	baseSize: int | None,
+) -> bool:
+	return tokensDiffer(
+		baseEtag,
+		remoteEtag,
+		baseTime,
+		remoteTime,
+		baseSize,
+		remoteSize,
+	)
+
+
+def _uploadLocal(
+	itemPath: str,
+	local: Path,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	if isEphemeralPath(itemPath) or isEphemeralName(local.name):
+		return
+	payload: Path = local
+	pinExists: bool = pinnedLocalPath(itemPath).is_file()
+	entry = getEntry(itemPath)
+	rowPinned: bool = entry is not None and bool(entry["pinned"])
+	if pinExists or rowPinned:
+		promoted: tuple[str, Path | None] = _promoteDirtyCache(itemPath, stats)
+		if promoted[0] == "blocked":
+			stats["skipped"] += 1
+			return
+		if promoted[0] == "file" and promoted[1] is not None:
+			payload = promoted[1]
+	with tryExclusiveWriteGuard(itemPath) as held:
+		if not held:
+			stats["skipped"] += 1
+			return
+		if not _ensureFilled(itemPath, payload):
+			stats["errors"] += 1
+			return
+		setSyncState(itemPath, SYNC_SYNCING)
+		setActivity("syncing", itemPath)
+		try:
+			copyFromLocal(str(payload), config.remotePath(itemPath), onStats)
+			stat = remoteStat(config.remotePath(itemPath))
+			modTime: str = ""
+			size: int = int(payload.stat().st_size)
+			if stat is not None:
+				modTime = str(stat.get("ModTime") or "")
+				size = int(stat.get("Size") or size)
+			if getEntry(itemPath) is None:
+				upsertEntry(
+					itemPath,
+					payload.name,
+					False,
+					size,
+					None,
+					modTime,
+					"",
+					contentTokenFromStat(stat) if stat is not None else "",
+					str(stat.get("ID") or "") if stat is not None else "",
+				)
+			if stat is None:
+				setSyncState(itemPath, SYNC_ERROR, "stat após envio falhou")
+				stats["errors"] += 1
+				return
+			adoptDownloadedFile(itemPath, payload, stat)
+			stats["uploaded"] += 1
+			notifyDirChanged(parentPath(itemPath))
+		except FastOneDriveError as error:
+			setSyncState(itemPath, SYNC_ERROR, str(error))
+			stats["errors"] += 1
+
+
+def _downloadBlocked(itemPath: str, allowDirty: bool) -> bool:
+	if writeGuardHeld(itemPath):
+		return True
+	if allowDirty:
+		return False
+	entry = getEntry(itemPath)
+	if entry is None:
+		return False
+	state: str = str(entry["syncState"] or "")
+	return state in ("dirty", "syncing", "conflict", "error")
+
+
+def _downloadRemote(
+	itemPath: str,
+	target: Path,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	allowDirty: bool = False,
+	guardHeld: bool = False,
+) -> None:
+	if guardHeld:
+		_downloadLocked(itemPath, target, stats, onStats, allowDirty)
+		return
+	if _downloadBlocked(itemPath, allowDirty):
+		stats["skipped"] += 1
+		return
+	if _preferDirtyCache(itemPath, stats, onStats):
+		return
+	with tryExclusiveWriteGuard(itemPath) as held:
+		if not held:
+			stats["skipped"] += 1
+			return
+		_downloadLocked(itemPath, target, stats, onStats, allowDirty)
+
+
+def _downloadLocked(
+	itemPath: str,
+	target: Path,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	allowDirty: bool,
+) -> None:
+	if not allowDirty and _downloadStateBlocked(itemPath):
+		stats["skipped"] += 1
+		return
+	protectCache: bool = _dirtyCacheBeside(itemPath, target)
+	if not protectCache:
+		setSyncState(itemPath, SYNC_SYNCING)
+	setActivity("syncing", itemPath)
+	try:
+		size: int = remoteSizeBytes(
+			config.remotePath(itemPath),
+			useFilters=False,
+		)
+		target.parent.mkdir(parents=True, exist_ok=True)
+		assertFreeSpace(target.parent, size)
+		suppressPath(itemPath)
+		copyToReplace(config.remotePath(itemPath), str(target), onStats)
+		stat = remoteStat(config.remotePath(itemPath))
+		if stat is not None:
+			size = int(stat.get("Size") or size)
+		if target == pinnedLocalPath(itemPath) or getEntry(itemPath) is None:
+			upsertPinned(itemPath, True, target.name, False, size)
+		if stat is None:
+			setSyncState(itemPath, SYNC_ERROR, "stat após descarga falhou")
+			stats["errors"] += 1
+			return
+		adoptDownloadedFile(itemPath, target, stat, protectCache)
+		stats["downloaded"] += 1
+		notifyDirChanged(parentPath(itemPath))
+	except FastOneDriveError as error:
+		setSyncState(itemPath, SYNC_ERROR, str(error))
+		stats["errors"] += 1
+
+
+def _downloadStateBlocked(itemPath: str) -> bool:
+	entry = getEntry(itemPath)
+	if entry is None:
+		return False
+	state: str = str(entry["syncState"] or "")
+	return state in ("dirty", "syncing", "conflict", "error")
+
+
+def _writeConflict(
+	itemPath: str,
+	local: Path,
+	stat: dict[str, object],
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	if not _readyToHash(itemPath, local, stats):
+		return
+	with tryExclusiveWriteGuard(itemPath) as held:
+		if not held:
+			stats["skipped"] += 1
+			return
+		stamp: str = datetime.now().strftime("%Y-%m-%d %H%M%S")
+		suffix: str = local.suffix
+		stem: str = local.stem
+		conflictName: str = f"{stem} (conflito local {stamp}){suffix}"
+		conflictPath: Path = local.with_name(conflictName)
+		number: int = 2
+		while conflictPath.exists():
+			conflictName = f"{stem} (conflito local {stamp}-{number}){suffix}"
+			conflictPath = local.with_name(conflictName)
+			number += 1
+		copy2(local, conflictPath)
+		conflictItem: str = f"{parentPath(itemPath)}/{conflictName}".lstrip("/")
+		origin = getEntry(itemPath)
+		upsertEntry(
+			conflictItem,
+			conflictName,
+			False,
+			int(conflictPath.stat().st_size),
+			True if origin is not None and bool(origin["pinned"]) else None,
+		)
+		markDirty(conflictItem)
+		_downloadRemote(
+			itemPath,
+			local,
+			stats,
+			onStats,
+			True,
+			True,
+		)
+	_uploadLocal(conflictItem, conflictPath, stats, onStats)
+	stats["conflicts"] += 1
+
+
+def _syncDirtyCache(
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+	onlyPath: str | None,
+) -> None:
+	root: Path = config.ensureCacheDir()
+	if onlyPath:
+		entry = getEntry(onlyPath)
+		if entry is not None and bool(entry["isDir"]):
+			return
+		target: Path = cacheLocalPath(onlyPath)
+		if target.is_file() and isCacheDirty(onlyPath):
+			_syncOnePath(onlyPath, stats, onStats, [])
+		return
+	children: list[Path] = sorted(
+		root.rglob("*"),
+		key=lambda path: len(path.parts),
+		reverse=True,
+	)
+	for child in children:
+		if not child.is_file():
+			continue
+		if isEphemeralName(child.name):
+			continue
+		try:
+			rel: str = child.resolve().relative_to(root.resolve()).as_posix()
+		except ValueError:
+			continue
+		if rel in ("", ".") or isStagingRel(rel) or isEphemeralPath(rel):
+			continue
+		if not isCacheDirty(rel):
+			continue
+		_syncOnePath(rel, stats, onStats, [])
+	evictCache(skip=isDirtyCacheFile)
+
+
+def _materializePinFromCache(
+	itemPath: str,
+	pinFile: Path,
+	cached: Path,
+	keepOnDisk: bool,
+	stats: dict[str, int],
+) -> tuple[str, Path | None] | None:
+	if not keepOnDisk or pinFile.is_dir() or not cached.is_file():
+		return None
+	if isPartial(itemPath) or isCacheDirty(itemPath):
+		return None
+	with tryExclusiveWriteGuard(itemPath) as held:
+		if not held:
+			return "blocked", None
+		if pinFile.is_file():
+			return "file", pinFile
+		if isCacheDirty(itemPath):
+			return None
+		if not cached.is_file():
+			return "blocked", None
+		staging: Path = pinFile.with_name(f".fod-staging-{pinFile.name}")
+		try:
+			pinFile.parent.mkdir(parents=True, exist_ok=True)
+			if pathPresent(staging):
+				staging.unlink()
+			copy2(cached, staging)
+			staging.replace(pinFile)
+		except OSError:
+			try:
+				if staging.is_file() or staging.is_symlink():
+					staging.unlink(missing_ok=True)
+			except OSError:
+				pass
+			stats["errors"] += 1
+			return "blocked", None
+	if pinFile.is_file():
+		return "file", pinFile
+	return None
+
+
+def _intactLocal(itemPath: str, stats: dict[str, int]) -> tuple[str, Path | None]:
+	entry = getEntry(itemPath)
+	pinnedFlag: bool = entry is not None and bool(entry["pinned"])
+	pinFile: Path = pinnedLocalPath(itemPath)
+	keepOnDisk: bool = pinnedFlag or pinFile.is_file()
+	if keepOnDisk and isCacheDirty(itemPath) and writeGuardHeld(itemPath):
+		return "blocked", None
+	if keepOnDisk:
+		promoted: tuple[str, Path | None] = _promoteDirtyCache(itemPath, stats)
+		if promoted[0] == "blocked":
+			return "blocked", None
+		if promoted[0] == "file" and promoted[1] is not None:
+			return "file", promoted[1]
+	if pinFile.is_file():
+		return "file", pinFile
+	cached: Path = cacheLocalPath(itemPath)
+	materialized: tuple[str, Path | None] | None = _materializePinFromCache(
+		itemPath,
+		pinFile,
+		cached,
+		keepOnDisk,
+		stats,
+	)
+	if materialized is not None:
+		return materialized
+	if not cached.is_file():
+		return "missing", None
+	if isPartial(itemPath):
+		if keepOnDisk:
+			return "download", None
+		if isCacheDirty(itemPath):
+			return "file", cached
+		return "missing", None
+	return "file", cached
+
+
+def _readyToHash(itemPath: str, local: Path, stats: dict[str, int]) -> bool:
+	if local != cacheLocalPath(itemPath) or not isPartial(itemPath):
+		return True
+	if _ensureFilled(itemPath, local):
+		return True
+	stats["errors"] += 1
+	return False
+
+
+def _ensureFilled(itemPath: str, local: Path) -> bool:
+	if not isPartial(itemPath):
+		return True
+	wasDirty: bool = isCacheDirty(itemPath)
+	if not local.is_file():
+		if wasDirty:
+			setSyncState(itemPath, SYNC_DIRTY, "ficheiro ainda tem buracos")
+		return False
+	target: Path = cacheLocalPath(itemPath)
+	if not target.is_file():
+		deleteChunkRow(itemPath)
+		return True
+	info: os.stat_result = target.stat()
+	stamp: tuple[float, float] = (info.st_atime, info.st_mtime)
+	fd: int = os.open(str(target), os.O_RDWR)
+	try:
+		try:
+			fillHoles(
+				itemPath,
+				config.remotePath(itemPath),
+				fd,
+				[],
+			)
+		except FastOneDriveError as error:
+			if wasDirty:
+				setSyncState(itemPath, SYNC_DIRTY, str(error))
+			return False
+	finally:
+		os.close(fd)
+		if target.is_file():
+			os.utime(target, stamp)
+	if isPartial(itemPath):
+		if wasDirty:
+			setSyncState(itemPath, SYNC_DIRTY, "ficheiro ainda tem buracos")
+		return False
+	return True
+
+
+def _removeLocalCopies(itemPath: str, local: Path) -> None:
+	local.unlink(missing_ok=True)
+	extra: Path
+	for extra in (pinnedLocalPath(itemPath), cacheLocalPath(itemPath)):
+		if extra == local:
+			continue
+		if extra.is_file() or extra.is_symlink():
+			extra.unlink(missing_ok=True)
+
+
+def scheduleItemSync(itemPath: str) -> None:
+	if itemPath == "" or isEphemeralPath(itemPath):
+		return
+	markDirty(itemPath)
+	from fastonedrive.watcher import debounceSync
+
+	debounceSync(itemPath)

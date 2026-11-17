@@ -1,0 +1,3 @@
+[D-BUS Service]
+Name=org.fastonedrive.krunner
+Exec=/usr/bin/fastonedrive krunner

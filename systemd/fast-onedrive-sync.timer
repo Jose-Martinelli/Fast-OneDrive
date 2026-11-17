@@ -1,0 +1,11 @@
+[Unit]
+Description=Fast-OneDrive — sync de pins e cache editado a cada 15 minutos
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=15min
+Persistent=true
+Unit=fast-onedrive-sync.service
+
+[Install]
+WantedBy=timers.target

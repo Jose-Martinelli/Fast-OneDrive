@@ -1,0 +1,21 @@
+# Exemplo. A unidade efectiva é gerada em ~/.config/systemd/user/
+# por `fastonedrive mount on` ou ao guardar as Definições.
+# Não instalar esta cópia do repo como unidade.
+
+[Unit]
+Description=Montagem OneDrive (Fast-OneDrive FUSE)
+After=network-online.target
+Wants=network-online.target
+Conflicts=rclone-onedrive.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 1
+ExecStartPre=-/usr/bin/fusermount3 -uz %h/OneDrive
+ExecStart=%h/.local/bin/fastonedrive fuse
+ExecStop=/usr/bin/fusermount3 -uz %h/OneDrive
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

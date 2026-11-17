@@ -1,0 +1,9 @@
+#!/usr/bin/python3.14
+import runpy
+import sys
+from pathlib import Path
+
+src: Path = Path(__file__).resolve().parent.parent / "src"
+sys.path.insert(0, str(src))
+sys.argv[0] = "fastonedrive"
+runpy.run_module("fastonedrive", run_name="__main__")

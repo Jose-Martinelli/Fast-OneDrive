@@ -1,0 +1,15 @@
+[Unit]
+Description=Fast-OneDrive — reindexar metadados OneDrive (Graph delta / rclone)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/fastonedrive index
+# Sem caminho: indexa cada perfil à parte; a falha de uma conta não pára as outras.
+# Desenvolvimento sem pacote: copie esta unidade para ~/.config/systemd/user/
+# e troque ExecStart por %h/.local/bin/fastonedrive index
+# Nunca apontar rclone RC para 127.0.0.1:5572 (mount).
+
+[Install]
+WantedBy=default.target

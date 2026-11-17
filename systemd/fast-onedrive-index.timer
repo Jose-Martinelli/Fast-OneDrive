@@ -1,0 +1,11 @@
+[Unit]
+Description=Fast-OneDrive — reindex a cada 6 horas
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+Persistent=true
+Unit=fast-onedrive-index.service
+
+[Install]
+WantedBy=timers.target

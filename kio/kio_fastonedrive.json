@@ -1,0 +1,33 @@
+{
+	"KDE-KIO-Protocols": {
+		"fastonedrive": {
+			"Class": ":local",
+			"Icon": "folder-cloud",
+			"copyFromFile": true,
+			"copyToFile": true,
+			"deleting": true,
+			"defaultMimetype": "application/octet-stream",
+			"input": "filesystem",
+			"listing": [
+				"Name",
+				"Type",
+				"Size",
+				"Date",
+				"MimeType"
+			],
+			"makedir": true,
+			"maxInstances": 8,
+			"maxInstancesPerHost": 8,
+			"moving": true,
+			"opening": true,
+			"output": "filesystem",
+			"protocol": "fastonedrive",
+			"reading": true,
+			"renameFromFile": false,
+			"renameToFile": false,
+			"show": true,
+			"source": true,
+			"writing": true
+		}
+	}
+}

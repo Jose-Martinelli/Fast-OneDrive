@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fast-OneDrive
+Comment=Ícone na bandeja do sistema
+Exec=@BIN@ settings --tray
+Icon=folder-cloud
+Terminal=false
+Categories=Qt;KDE;Utility;FileTools;
+StartupNotify=false
+X-KDE-autostart-after=panel
+Hidden=false

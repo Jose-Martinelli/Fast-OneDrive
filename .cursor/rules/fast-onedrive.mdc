@@ -1,0 +1,8 @@
+---
+description: Fast-OneDrive — add-on Plasma do rclone
+alwaysApply: true
+---
+
+Ler README.md, AGENTS.md e docs/*.md (incluindo CONTEXT.md) antes de alterar código.
+
+Add-on KDE que usa rclone (CLI), não um fork. Busca e cópia não passam pelo FUSE. Porta 5572 é o mount antigo (desligado). Mount Fast-OneDrive: FUSE próprio por perfil (sem RC 5573); jobs: subprocesso. Vários perfis: Local `fastonedrive:/p/<id>/`, dados em `profiles/<id>/`, pasta FUSE própria. Login de perfil novo: `rclone authorize` grava o token no `rclone.conf` sob flock; `rclone config update --non-interactive` segue sem o token em argv e sem stdin. Sem KFind, sem Ctrl+F no mount. Não instalar abraunegg/onedriver. Não sync do Drive inteiro.

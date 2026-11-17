@@ -1,0 +1,36 @@
+[Desktop Entry]
+Type=Service
+MimeType=all/allfiles;inode/directory;
+Actions=pin;unpin;share;freespace;
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+ServiceTypes=KonqPopupMenu/Plugin
+X-KDE-Priority=TopLevel
+X-KDE-Protocols=fastonedrive
+Icon=folder-cloud
+Name=Fast-OneDrive
+Exec=@PYTHON@ "@LAUNCHER@" pin %U
+StartupNotify=false
+
+[Desktop Action pin]
+Name=Manter localmente
+Icon=pin
+Exec=@PYTHON@ "@LAUNCHER@" pin %U
+StartupNotify=false
+
+[Desktop Action unpin]
+Name=Deixar de manter localmente
+Icon=offline
+Exec=@PYTHON@ "@LAUNCHER@" unpin %U
+StartupNotify=false
+
+[Desktop Action share]
+Name=Partilhar ligação
+Icon=document-share
+Exec=@PYTHON@ "@LAUNCHER@" share %U
+StartupNotify=false
+
+[Desktop Action freespace]
+Name=Libertar espaço neste PC
+Icon=edit-clear
+Exec=@PYTHON@ "@LAUNCHER@" free-space %U
+StartupNotify=false

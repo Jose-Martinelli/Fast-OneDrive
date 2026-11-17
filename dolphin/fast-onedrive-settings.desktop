@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Fast-OneDrive
+GenericName=Pesquisa e definições
+Comment=Pesquisar no OneDrive e definir cópia, pin e limites
+Exec=@BIN@ settings
+Icon=folder-cloud
+Terminal=false
+Categories=Qt;KDE;Utility;FileTools;
+StartupNotify=true
+StartupWMClass=fastonedrive

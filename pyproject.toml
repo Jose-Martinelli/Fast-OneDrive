@@ -1,0 +1,18 @@
+[project]
+name = "fastonedrive"
+version = "0.1.0"
+description = "Add-on Plasma do rclone: índice, busca por nome e cópia sem FUSE"
+requires-python = ">=3.11"
+
+[project.scripts]
+fastonedrive = "fastonedrive.cli:main"
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]

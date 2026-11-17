@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Fast-OneDrive
+NoDisplay=true
+MimeType=x-scheme-handler/fastonedrive;
+Exec=@BIN@ open-url %u
+StartupNotify=false
+Terminal=false
