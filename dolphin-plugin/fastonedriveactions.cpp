@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Submenu "OneDrive" no botão direito do Dolphin para ficheiros em ~/OneDrive, como o
 // menu do OneDrive no Explorer do Windows. Cada acção arranca o CLI fastonedrive em
 // segundo plano; o CLI infere o perfil pela pasta da montagem.

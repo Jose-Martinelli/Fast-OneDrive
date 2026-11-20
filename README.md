@@ -146,3 +146,7 @@ Os testes em `tests/` não precisam de rede nem de `/dev/fuse`. Com `rclone` no 
 ## Nome
 
 Pasta do repo: `Fast-OneDrive`. Pacote Python / CLI: `fastonedrive` (sem hífen). Pacote Arch: `fast-onedrive`. Unidade systemd: `fast-onedrive-mount@<id>.service`.
+
+## Licença
+
+[LGPL-3.0-or-later](LICENSE) — GNU Lesser General Public License v3.0 ou posterior.

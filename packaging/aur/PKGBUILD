@@ -14,7 +14,7 @@ pkgrel=1
 pkgdesc="OneDrive no Dolphin como no Windows: ~/OneDrive a pedido, emblemas, busca e cópia rápida (sobre o rclone)"
 arch=('x86_64')
 url="${_repo}"
-license=('MIT')
+license=('LGPL-3.0-or-later')
 depends=(
 	'rclone>=1.68'
 	'python'

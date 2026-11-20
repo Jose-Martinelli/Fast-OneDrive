@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Ajudas partilhadas pelos plugins do Dolphin: que pastas são montagens Fast-OneDrive
 // e qual o estado de um caminho (atributo user.fastonedrive.state servido pelo FUSE).
 #pragma once

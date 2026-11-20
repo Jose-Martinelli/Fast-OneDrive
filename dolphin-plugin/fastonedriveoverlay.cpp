@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: LGPL-3.0-or-later
 // Emblemas de estado em ~/OneDrive (e em qualquer montagem fuse.fastonedrive).
 //
 // O Dolphin chama getOverlays() na thread da interface e pede que não bloqueie. O
