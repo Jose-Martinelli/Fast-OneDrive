@@ -39,9 +39,12 @@ class OauthSession:
 	_process: subprocess.Popen[str] | None
 	_pendingState: str
 
-	def __init__(self, remoteId: str, driveType: str) -> None:
+	def __init__(self, remoteId: str, driveType: str, clientId: str = "", clientSecret: str = "") -> None:
 		self.remoteId = remoteId
 		self.driveType = driveType
+		# App Azure própria: evita os limites (429) da app partilhada do rclone.
+		self.clientId = clientId.strip()
+		self.clientSecret = clientSecret.strip()
 		self._process = None
 		self._pendingState = ""
 		self._cancelled = False
@@ -124,11 +127,20 @@ class OauthSession:
 		token: str = self._authorizeOnedrive()
 		if self._cancelled:
 			raise FastOneDriveError("login cancelado")
-		writeRemoteToken(self.remoteId, token)
+		fields: dict[str, str] = {}
+		if self.clientId != "":
+			fields["client_id"] = self.clientId
+			fields["client_secret"] = self.clientSecret
+		writeRemoteToken(self.remoteId, token, fields)
 
 	def _authorizeOnedrive(self) -> str:
 		process: subprocess.Popen[str] = subprocess.Popen(
-			[rcloneBin(), "authorize", "onedrive"],
+			[
+				rcloneBin(),
+				"authorize",
+				"onedrive",
+				*([self.clientId, self.clientSecret] if self.clientId != "" else []),
+			],
 			stdin=subprocess.DEVNULL,
 			stdout=subprocess.PIPE,
 			stderr=subprocess.PIPE,

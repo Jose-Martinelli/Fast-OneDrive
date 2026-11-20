@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import traceback
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -36,6 +37,8 @@ def ensureLogger() -> logging.Logger:
 
 
 def logInfo(message: str, extra: dict[str, object] | None = None) -> None:
+	if os.environ.get("FASTONEDRIVE_QUIET", "") == "1":
+		return
 	ensureLogger().info(_withExtra(message, extra))
 
 

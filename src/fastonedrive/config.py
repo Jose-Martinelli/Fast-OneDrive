@@ -26,7 +26,6 @@ PIN_SKIP_SEGMENTS: tuple[str, ...] = ("roms", "backups")
 MB_BYTES: int = 1024 * 1024
 KRUNNER_BUS_NAME: str = "org.fastonedrive.krunner"
 KRUNNER_OBJECT_PATH: str = "/runner"
-RC_JOBS_ADDR: str = "127.0.0.1:5573"
 FORBIDDEN_RC_ADDR: str = "127.0.0.1:5572"
 DEFAULT_VFS_CACHE_MODE: str = "full"
 DEFAULT_VFS_CACHE_MAX_SIZE: str = "150G"
@@ -291,10 +290,13 @@ def cliBin() -> str:
 	local: Path = homeDir() / ".local" / "bin" / "fastonedrive"
 	if local.is_file():
 		return str(local)
+	system: Path = Path("/usr/bin/fastonedrive")
+	if system.is_file():
+		return str(system)
 	found: str | None = shutil.which("fastonedrive")
 	if found is not None:
 		return found
-	raise FastOneDriveError("CLI fastonedrive não encontrado em ~/.local/bin")
+	raise FastOneDriveError("CLI fastonedrive não encontrado em ~/.local/bin nem em /usr/bin")
 
 
 def defaultCopyDest() -> Path:
@@ -365,21 +367,49 @@ def importSystemRcloneConfig() -> Path:
 	dest.parent.mkdir(parents=True, exist_ok=True)
 	if source.resolve() == dest.resolve():
 		return dest
-	body: str = source.read_text(encoding="utf-8")
-	with rcloneConfigLock():
-		tmp: Path = dest.with_name(f".{dest.name}.tmp")
-		try:
-			with tmp.open("w", encoding="utf-8") as handle:
-				handle.write(body)
-				handle.flush()
-				os.fsync(handle.fileno())
-			os.chmod(tmp, 0o600)
-			os.replace(tmp, dest)
-		except Exception:
-			tmp.unlink(missing_ok=True)
-			raise
-	dest.chmod(0o600)
+	from fastonedrive.profiles import _replaceConfigText
+
+	from fastonedrive.secretconf import plainConfigForEdit
+
+	incoming: str = source.read_text(encoding="utf-8")
+	with plainConfigForEdit(dest), rcloneConfigLock():
+		current: str = dest.read_text(encoding="utf-8") if dest.is_file() else ""
+		_replaceConfigText(dest, _mergeMissingSections(current, incoming))
 	return dest
+
+
+def _mergeMissingSections(current: str, incoming: str) -> str:
+	present: set[str] = set(_rcloneSections(current))
+	added: list[str] = [
+		block for header, block in _rcloneSections(incoming).items() if header not in present
+	]
+	if len(added) == 0:
+		return current
+	merged: str = current
+	if merged != "" and not merged.endswith("\n"):
+		merged += "\n"
+	if merged != "" and not merged.endswith("\n\n"):
+		merged += "\n"
+	return merged + "\n".join(block.rstrip("\n") + "\n" for block in added)
+
+
+def _rcloneSections(text: str) -> dict[str, str]:
+	sections: dict[str, str] = {}
+	header: str = ""
+	lines: list[str] = []
+	for line in text.splitlines(keepends=True):
+		stripped: str = line.strip()
+		if stripped.startswith("[") and stripped.endswith("]"):
+			if header != "":
+				sections[header] = "".join(lines)
+			header = stripped[1:-1].strip()
+			lines = [line]
+			continue
+		if header != "":
+			lines.append(line)
+	if header != "":
+		sections[header] = "".join(lines)
+	return sections
 
 
 def saveUserConfig(
@@ -460,7 +490,7 @@ def copyDestPath() -> Path:
 
 
 def openMaxBytes() -> int:
-	value: object = _userConfig().get("openMaxBytes", DEFAULT_OPEN_MAX_BYTES)
+	value: Any = _userConfig().get("openMaxBytes", DEFAULT_OPEN_MAX_BYTES)
 	try:
 		return int(value)
 	except (TypeError, ValueError):
@@ -650,32 +680,6 @@ def jobFilterFlags() -> list[str]:
 	return flags
 
 
-def mountOptionFlags() -> list[str]:
-	values: dict[str, Any] = rcloneFlagValues()
-	flags: list[str] = [
-		"--vfs-cache-mode",
-		str(values["vfsCacheMode"]),
-		"--vfs-cache-max-size",
-		str(values["vfsCacheMaxSize"]),
-		"--vfs-cache-max-age",
-		str(values["vfsCacheMaxAge"]),
-		"--vfs-write-back",
-		str(values["vfsWriteBack"]),
-		"--dir-cache-time",
-		str(values["dirCacheTime"]),
-		"--poll-interval",
-		str(values["pollInterval"]),
-	]
-	if bool(values["vfsFastFingerprint"]):
-		flags.append("--vfs-fast-fingerprint")
-	for pattern in rcloneExclude():
-		flags.extend(["--exclude", pattern])
-	flags.extend(_sanitizeUserFlags(_extraFlagTokens(), allowVfs=True))
-	flags.extend(["--rc", "--rc-no-auth", "--rc-addr", RC_JOBS_ADDR])
-	_assertSafeFlags(flags, allowRc=True)
-	return flags
-
-
 def bytesToMb(value: int) -> int:
 	return max(0, int(value) // MB_BYTES)
 
@@ -826,17 +830,18 @@ def _sanitizeUserFlags(parts: list[str], allowVfs: bool) -> list[str]:
 	for part in parts:
 		if skipValue:
 			skipValue = False
-			continue
+			if not part.startswith("-"):
+				continue
 		if FORBIDDEN_RC_ADDR in part or part.endswith(":5572"):
 			raise FastOneDriveError("a porta 5572 é o mount antigo; não usar")
 		if part.startswith("--rc") or part == "--config" or part.startswith("--config="):
-			skipValue = part in _VALUE_FLAGS
+			skipValue = "=" not in part
 			continue
 		if (not allowVfs) and (
 			part.startswith("--vfs-")
 			or part in ("--dir-cache-time", "--poll-interval")
 		):
-			skipValue = part in _VALUE_FLAGS
+			skipValue = "=" not in part
 			continue
 		result.append(part)
 	return result

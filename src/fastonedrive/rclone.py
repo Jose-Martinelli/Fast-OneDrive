@@ -299,13 +299,32 @@ def contentToken(
 ) -> str:
 	quick: str = quickXor.strip()
 	if quick != "":
-		return f"qxh:{quick}"
+		return canonicalToken(f"qxh:{quick}")
 	digest: str = sha1.strip()
 	if digest != "":
-		return f"sha1:{digest}"
+		return canonicalToken(f"sha1:{digest}")
 	if modTime is None:
 		return ""
 	return f"mt:{int(modTime.timestamp())}:{int(size)}"
+
+
+def canonicalToken(value: str) -> str:
+	"""Uma só forma por conteúdo: QuickXor em base64 (como o Graph/delta), SHA1 em
+	minúsculas. O rclone e o graphStat davam o QuickXor em hex e o delta em base64:
+	o mesmo ficheiro parecia mudado na nuvem e cada gravação virava "conflito local"."""
+	text: str = value.strip()
+	if text.startswith("qxh:"):
+		raw: bytes | None = _decodeQuickXor(text[4:])
+		if raw is None or len(raw) != 20:
+			return text
+		return "qxh:" + base64.b64encode(raw).decode("ascii")
+	if text.startswith("sha1:"):
+		return "sha1:" + text[5:].strip().lower()
+	return text
+
+
+def sameToken(left: str, right: str) -> bool:
+	return canonicalToken(left) == canonicalToken(right)
 
 
 def tokenKind(value: str) -> str:
@@ -347,7 +366,7 @@ def tokensDiffer(
 	leftKind: str = tokenKind(left)
 	rightKind: str = tokenKind(right)
 	if leftKind != "" and leftKind == rightKind:
-		return left != right
+		return not sameToken(left, right)
 	return _clockOrSizeDiffer(leftTime, rightTime, leftSize, rightSize)
 
 
@@ -404,7 +423,7 @@ def hashLocalQuickXor(path: Path) -> str:
 			continue
 		digest: str = parts[0].strip()
 		if digest != "":
-			return f"qxh:{digest}"
+			return canonicalToken(f"qxh:{digest}")
 	return ""
 
 
@@ -848,7 +867,9 @@ def _command(args: list[str], useFilters: bool = True) -> list[str]:
 	conf: str = str(config.rcloneConfigPath())
 	applyFilters: bool = useFilters and _rcloneOperation(args) not in _FILE_ONLY_OPS
 	filters: list[str] = config.jobFilterFlags() if applyFilters else []
-	command: list[str] = [rcloneBin(), "--config", conf, *filters, *args]
+	from fastonedrive.synccontrol import bwLimitFlags
+
+	command: list[str] = [rcloneBin(), "--config", conf, *filters, *bwLimitFlags(), *args]
 	for arg in command:
 		if arg.startswith("--rc"):
 			raise FastOneDriveError("flags RC não são permitidas neste processo")

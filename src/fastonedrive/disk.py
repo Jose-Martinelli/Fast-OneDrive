@@ -141,7 +141,17 @@ def isEphemeralName(name: str) -> bool:
 		return True
 	if name.startswith(".") and lower.endswith(".swp"):
 		return True
-	if name.startswith(".bak-") or lower.endswith(".partial"):
+	if name.startswith(".bak-") or lower.endswith(".partial") or lower.endswith(".part"):
+		return True
+	# Ficheiros de trabalho de editores: swap do Kate, backup "nome~", teste do vim,
+	# lock do emacs. Ficam só no disco, nunca sobem.
+	# ".part" = temporário do Dolphin/KIO (criar/gravar → rename para o nome final).
+	if lower.endswith(".kate-swp") or (name.endswith("~") and len(name) > 1):
+		return True
+	if name == "4913" or name.startswith(".#") or (name.startswith("#") and name.endswith("#")):
+		return True
+	# Lixo do KIO (".Trash-1000/info/…trashinfo"): nunca sobe para a nuvem.
+	if name == ".Trash" or (name.startswith(".Trash-") and name[7:].isdigit()):
 		return True
 	return False
 
@@ -176,6 +186,9 @@ def cleanupJobArtifacts(parent: Path, name: str) -> None:
 			removePath(path, ignoreErrors=True)
 
 
+STAGING_MIN_AGE_SEC: float = 300.0
+
+
 def pruneJobArtifacts(root: Path, includePartials: bool = False, recursive: bool = False) -> int:
 	if not root.is_dir():
 		return 0
@@ -185,9 +198,23 @@ def pruneJobArtifacts(root: Path, includePartials: bool = False, recursive: bool
 	else:
 		children = list(root.iterdir())
 	deleted: int = 0
+	now: float = time.time()
 	for child in children:
 		if not _isJobArtifactName(child.name, includePartials):
 			continue
+		# Um put/copy KIO grava em .fod-staging-* noutro processo; o sync-pins
+		# não pode apagar um staging ainda a ser escrito.
+		# O mesmo para um download (.fod-partial) ainda a correr noutro processo.
+		if (
+			child.name.startswith(".fod-staging-")
+			or child.name.startswith(".staging-")
+			or child.name.endswith(".fod-partial")
+		):
+			try:
+				if now - float(child.stat().st_mtime) < STAGING_MIN_AGE_SEC:
+					continue
+			except OSError:
+				continue
 		removePath(child, ignoreErrors=True)
 		if not pathPresent(child):
 			deleted += 1
@@ -251,12 +278,6 @@ def swapIntoPlace(staging: Path, target: Path) -> None:
 @contextmanager
 def pinsLock() -> Iterator[None]:
 	with _exclusiveLock("pins.lock"):
-		yield
-
-
-@contextmanager
-def diskJobsLock() -> Iterator[None]:
-	with _exclusiveLock("disk.lock"):
 		yield
 
 
@@ -341,6 +362,11 @@ def evictCache(
 			continue
 		_dropChunkRow(root, path)
 		total -= size
+
+
+def localFileBusy(path: Path) -> bool:
+	"""True se há handle aberto (LOCK_SH/EX) — FUSE `_holdShared` ou escrita."""
+	return _evictionBlocked(path)
 
 
 def _evictionBlocked(path: Path) -> bool:

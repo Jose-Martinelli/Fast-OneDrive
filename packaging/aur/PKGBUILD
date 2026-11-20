@@ -1,0 +1,133 @@
+# Maintainer: <o seu nome> <o seu email>
+# Receita AUR (fast-onedrive-git). Antes de publicar:
+#   1. Pôr o repositório num git público e trocar _repo abaixo.
+#   2. makepkg -si            (testar)
+#   3. makepkg --printsrcinfo > .SRCINFO
+#   4. git push para ssh://aur@aur.archlinux.org/fast-onedrive-git.git
+# Plugins em /usr/lib/qt6/plugins: o Dolphin vê-os sem voltar a entrar na sessão.
+
+_repo="https://github.com/CHANGE-ME/Fast-OneDrive"
+pkgname=fast-onedrive-git
+_pkgsrc=fast-onedrive
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="OneDrive no Dolphin como no Windows: ~/OneDrive a pedido, emblemas, busca e cópia rápida (sobre o rclone)"
+arch=('x86_64')
+url="${_repo}"
+license=('MIT')
+depends=(
+	'rclone>=1.68'
+	'python'
+	'python-pyqt6'
+	'python-dbus'
+	'python-gobject'
+	'kio'
+	'kdialog'
+	'qt6-base'
+	'fuse2'
+	'fuse3'
+	'sqlite>=3.45'
+)
+optdepends=(
+	'baloo: excluir ~/OneDrive da indexação automaticamente'
+	'libsecret: guardar a senha do rclone.conf cifrado (secret-tool)'
+	'kwallet: guardar a senha do rclone.conf cifrado (kwallet-query)'
+)
+checkdepends=('python-pytest')
+makedepends=(
+	'git'
+	'cmake'
+	'extra-cmake-modules'
+	'gcc'
+	'kcoreaddons'
+	'kio'
+	'python-build'
+	'python-installer'
+	'python-setuptools'
+	'python-wheel'
+	'qt6-base'
+)
+provides=('fast-onedrive')
+conflicts=('fast-onedrive')
+install=fast-onedrive.install
+source=("${_pkgsrc}::git+${_repo}.git")
+sha256sums=('SKIP')
+
+pkgver() {
+	cd "${srcdir}/${_pkgsrc}"
+	local base
+	base="$(sed -n 's/^version = "\(.*\)"/\1/p' pyproject.toml | head -1)"
+	printf "%s.r%s.%s" "${base}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+build() {
+	cd "${srcdir}/${_pkgsrc}"
+	python -m build --wheel --no-isolation --outdir "${srcdir}/dist"
+	cmake -S kio -B "${srcdir}/build-kio" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+	cmake --build "${srcdir}/build-kio"
+	cmake -S dolphin-plugin -B "${srcdir}/build-dolphin" -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+	cmake --build "${srcdir}/build-dolphin"
+}
+
+check() {
+	cd "${srcdir}/${_pkgsrc}"
+	# Os testes de integração com um remote rclone real saltam sozinhos sem rede.
+	PYTHONPATH=src python -m pytest -q
+}
+
+package() {
+	cd "${srcdir}/${_pkgsrc}"
+	python -m installer --destdir="${pkgdir}" "${srcdir}/dist/"*.whl
+	DESTDIR="${pkgdir}" cmake --install "${srcdir}/build-kio"
+	DESTDIR="${pkgdir}" cmake --install "${srcdir}/build-dolphin"
+	install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${_pkgsrc}/LICENSE"
+
+	for size in 16 22 24 32 48 64 128 256 512; do
+		install -Dm644 "icons/hicolor/${size}x${size}/apps/fastonedrive.png" \
+			"${pkgdir}/usr/share/icons/hicolor/${size}x${size}/apps/fastonedrive.png"
+	done
+	install -Dm644 icon.png "${pkgdir}/usr/share/pixmaps/fastonedrive.png"
+
+	install -Dm755 dolphin/servicemenu.py \
+		"${pkgdir}/usr/lib/fast-onedrive/servicemenu.py"
+	local python_bin="/usr/bin/python3"
+	sed \
+		-e "s|@PYTHON@|${python_bin}|g" \
+		-e "s|@LAUNCHER@|/usr/lib/fast-onedrive/servicemenu.py|g" \
+		dolphin/fast-onedrive.desktop \
+		> "${srcdir}/fast-onedrive-menu.desktop"
+	install -Dm755 "${srcdir}/fast-onedrive-menu.desktop" \
+		"${pkgdir}/usr/share/kio/servicemenus/fast-onedrive.desktop"
+
+	sed -e "s|@BIN@|/usr/bin/fastonedrive|g" \
+		dolphin/fast-onedrive-settings.desktop \
+		> "${srcdir}/fast-onedrive.desktop"
+	install -Dm644 "${srcdir}/fast-onedrive.desktop" \
+		"${pkgdir}/usr/share/applications/fast-onedrive.desktop"
+
+	sed -e "s|@BIN@|/usr/bin/fastonedrive|g" \
+		dolphin/fast-onedrive-open.desktop \
+		> "${srcdir}/fast-onedrive-open.desktop"
+	install -Dm644 "${srcdir}/fast-onedrive-open.desktop" \
+		"${pkgdir}/usr/share/applications/fast-onedrive-open.desktop"
+
+	sed -e "s|@BIN@|/usr/bin/fastonedrive|g" \
+		dolphin/fast-onedrive-autostart.desktop \
+		> "${srcdir}/fast-onedrive-autostart.desktop"
+	install -Dm644 "${srcdir}/fast-onedrive-autostart.desktop" \
+		"${pkgdir}/etc/xdg/autostart/fast-onedrive.desktop"
+
+	install -Dm644 krunner/plasma-runner-fastonedrive.desktop \
+		"${pkgdir}/usr/share/krunner/dbusplugins/plasma-runner-fastonedrive.desktop"
+	install -Dm644 packaging/arch/org.fastonedrive.krunner.service \
+		"${pkgdir}/usr/share/dbus-1/services/org.fastonedrive.krunner.service"
+
+	install -Dm644 systemd/fast-onedrive-index.service \
+		"${pkgdir}/usr/lib/systemd/user/fast-onedrive-index.service"
+	install -Dm644 systemd/fast-onedrive-index.timer \
+		"${pkgdir}/usr/lib/systemd/user/fast-onedrive-index.timer"
+	install -Dm644 systemd/fast-onedrive-sync.service \
+		"${pkgdir}/usr/lib/systemd/user/fast-onedrive-sync.service"
+	install -Dm644 systemd/fast-onedrive-sync.timer \
+		"${pkgdir}/usr/lib/systemd/user/fast-onedrive-sync.timer"
+}

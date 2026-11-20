@@ -44,16 +44,19 @@ def copyDriveToDrive(
 	overwrite: bool = False,
 ) -> str:
 	sourceRemote: str = toRemotePath(source)
+	sourceItem: str = remoteItemPath(sourceRemote)
+	# O perfil da origem tem de continuar activo ao escolher a cópia local;
+	# toRemotePath(dest) activa o destino e o pin/cache lidos seriam os errados.
+	local: Path | None = _intactLocalFile(sourceItem)
+	localPath: str | None = str(local) if local is not None else None
 	destRemote: str = toRemotePath(dest)
 	if sourceRemote == destRemote:
 		return destRemote
-	sourceItem: str = remoteItemPath(sourceRemote)
 	destItem: str = remoteItemPath(destRemote)
-	local: Path | None = _intactLocalFile(sourceItem)
-	if local is not None:
+	if localPath is not None:
 		from fastonedrive.mutate import stageLocalWrite
 
-		return stageLocalWrite(str(local), destRemote, overwrite)
+		return stageLocalWrite(localPath, destRemote, overwrite)
 	from fastonedrive.index import parentPath, refreshParentListing
 	from fastonedrive.mutate import (
 		_finishPreserved,

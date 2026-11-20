@@ -1,8 +1,16 @@
 [project]
 name = "fastonedrive"
-version = "0.1.0"
-description = "Add-on Plasma do rclone: índice, busca por nome e cópia sem FUSE"
+version = "0.2.0"
+description = "Integração do OneDrive no KDE Plasma sobre o rclone: pasta ~/OneDrive com ficheiros a pedido, busca e cópia rápida"
 requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+# PyQt6, dbus-python e PyGObject vêm do sistema (python-pyqt6, python-dbus, python-gobject).
+gui = ["PyQt6"]
+krunner = ["dbus-python", "PyGObject"]
+dev = ["pytest", "ruff", "mypy"]
 
 [project.scripts]
 fastonedrive = "fastonedrive.cli:main"
@@ -16,3 +24,27 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["src/fastonedrive/_fusepy.py"]
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.11"
+files = ["src/fastonedrive"]
+exclude = ["_fusepy\\.py$"]
+ignore_missing_imports = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = "fastonedrive._fusepy"
+ignore_errors = true

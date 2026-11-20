@@ -1,3 +1,4 @@
+import filecmp
 import os
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
@@ -10,8 +11,10 @@ from fastonedrive.disk import (
 	assertFreeSpace,
 	cacheJobsLock,
 	evictCache,
+	localFileBusy,
 	pruneJobArtifacts,
 	suppressPath,
+	writeGuardHeld,
 )
 from fastonedrive.chunks import deleteChunkRow, fillHoles, isPartial
 from fastonedrive.index import (
@@ -22,6 +25,8 @@ from fastonedrive.index import (
 	setSyncState,
 	updateFileMeta,
 )
+from fastonedrive.graphitems import fastRemoteStat
+from fastonedrive.log import logError
 from fastonedrive.notify import notifyDirChanged
 from fastonedrive.paths import remoteItemPath, toRemotePath
 from fastonedrive.rclone import (
@@ -66,7 +71,7 @@ def _hydrateRemote(source: str, onStats: Callable[[str], None] | None) -> Path:
 	remoteTime: datetime | None = None
 	stat: dict[str, Any] | None = None
 	try:
-		stat = remoteStat(remotePath)
+		stat = fastRemoteStat(remotePath)
 	except FastOneDriveError:
 		stat = None
 	if stat is not None:
@@ -87,8 +92,14 @@ def _hydrateRemote(source: str, onStats: Callable[[str], None] | None) -> Path:
 		except (IndexError, KeyError, TypeError):
 			indexToken = ""
 	if isPartial(itemPath):
-		target.unlink(missing_ok=True)
-		deleteChunkRow(itemPath)
+		if writeGuardHeld(itemPath) or (target.is_file() and localFileBusy(target)):
+			if target.is_file():
+				_fillDirtyPartial(itemPath, remotePath, target)
+				_markCacheWritable(itemPath, target)
+				return target
+		else:
+			target.unlink(missing_ok=True)
+			deleteChunkRow(itemPath)
 	if _cacheIsFresh(
 		target,
 		size,
@@ -100,7 +111,7 @@ def _hydrateRemote(source: str, onStats: Callable[[str], None] | None) -> Path:
 		if entry is None or not isContentToken(str(entry["baseEtag"] or "")):
 			fresh: dict[str, Any] | None = stat if isinstance(stat, dict) else None
 			if fresh is None:
-				fresh = remoteStat(remotePath)
+				fresh = fastRemoteStat(remotePath)
 			if fresh is not None:
 				adoptDownloadedFile(itemPath, target, fresh)
 		return target
@@ -122,14 +133,53 @@ def _hydrateRemote(source: str, onStats: Callable[[str], None] | None) -> Path:
 			evictCache(skip=isDirtyCacheFile)
 			assertFreeSpace(target.parent, size)
 	suppressPath(itemPath)
-	copyToReplace(remotePath, str(target), onStats)
+	freshStat: dict[str, Any] | None = None
+	try:
+		# HTTP directo ao Graph: sem arrancar o rclone (vários segundos por processo).
+		from fastonedrive.graphitems import downloadToFile, graphStat
+
+		freshStat, url = graphStat(itemPath)
+		downloadToFile(itemPath, target, url)
+	except FastOneDriveError as error:
+		logError(f"download Graph falhou, a usar rclone: {error}", extra={"path": itemPath})
+		copyToReplace(remotePath, str(target), onStats)
+		freshStat = fastRemoteStat(remotePath)
 	_markCacheWritable(itemPath, target)
-	freshStat: dict[str, Any] | None = remoteStat(remotePath)
 	if freshStat is not None:
 		adoptDownloadedFile(itemPath, target, freshStat)
 	evictCache(protect=target, skip=isDirtyCacheFile)
 	notifyDirChanged(parentPath(itemPath))
+	from fastonedrive.notify import notifyStateChanged
+
+	notifyStateChanged(itemPath)
 	return target
+
+
+def ensureCacheBaseline(itemPath: str) -> None:
+	"""Antes de editar uma cópia em cache sem linha de base: se o conteúdo é igual ao
+	da nuvem (QuickXor), adoptar a versão da nuvem como base. Ficheiros abertos a pedido
+	antes da 0.2.1 ficaram sem base e cada edição virava conflito."""
+	entry = getEntry(itemPath)
+	if entry is None or bool(entry["pinned"]) or bool(entry["isDir"]):
+		return
+	if str(entry["baseEtag"] or "") != "" or isPartial(itemPath):
+		return
+	# O QuickXor abaixo decide se o conteúdo é o da nuvem; o mtime não chega
+	# (isCacheDirty olha só para a data).
+	if str(entry["syncState"] or "") in ("dirty", "syncing", "conflict", "error"):
+		return
+	remoteToken: str = str(entry["etag"] or "")
+	if tokenKind(remoteToken) != "qxh":
+		return
+	target: Path = cacheLocalPath(itemPath)
+	if not target.is_file() or target.stat().st_size > config.openMaxBytes():
+		return
+	try:
+		local: str = hashLocalQuickXor(target)
+	except FastOneDriveError:
+		return
+	if quickXorEqual(local, remoteToken) is True:
+		setBaseline(itemPath, str(entry["modTime"] or ""), remoteToken, keepSyncState=True)
 
 
 def _cacheBlocked(entry: object) -> bool:
@@ -209,7 +259,7 @@ def cleanCacheIsStale(itemPath: str) -> bool:
 def _dropIfStale(itemPath: str, target: Path) -> bool:
 	remotePath: str = config.remotePath(itemPath)
 	try:
-		stat: dict[str, Any] | None = remoteStat(remotePath)
+		stat: dict[str, Any] | None = fastRemoteStat(remotePath)
 	except FastOneDriveError:
 		return False
 	if stat is None:
@@ -255,7 +305,12 @@ def _dropIfStale(itemPath: str, target: Path) -> bool:
 		except (IndexError, KeyError, TypeError):
 			etag = ""
 	modTime: str = str(stat.get("ModTime") or "")
-	if remoteLarge:
+	shrunk: bool = target.is_file() and target.stat().st_size > size
+	if (remoteLarge or shrunk) and (
+		writeGuardHeld(itemPath) or (target.is_file() and localFileBusy(target))
+	):
+		return False
+	if remoteLarge or shrunk:
 		target.unlink(missing_ok=True)
 		deleteChunkRow(itemPath)
 		clearItemBaseline(itemPath)
@@ -274,6 +329,7 @@ def adoptDownloadedFile(
 	local: Path,
 	stat: dict[str, Any],
 	protectDirtyCache: bool | None = None,
+	guardHeld: bool = False,
 ) -> None:
 	cached: Path = cacheLocalPath(itemPath)
 	if protectDirtyCache is None:
@@ -281,12 +337,24 @@ def adoptDownloadedFile(
 	when: datetime | None = parseRemoteModTime(str(stat.get("ModTime") or ""))
 	stamp: float | None = when.timestamp() if when is not None else None
 	paths: list[Path] = [local]
+	current = getEntry(itemPath)
+	uploading: bool = (
+		not guardHeld and current is not None and str(current["syncState"] or "") == "syncing"
+	)
 	for extra in (pinnedLocalPath(itemPath), cached):
 		if extra in paths:
 			continue
 		if protectDirtyCache and extra == cached:
 			continue
-		paths.append(extra)
+		if not extra.is_file() or _sameFileOnDisk(extra, local):
+			continue
+		if _sameContent(extra, local):
+			paths.append(extra)
+		elif extra == cached and not uploading and (guardHeld or not writeGuardHeld(itemPath)):
+			if localFileBusy(cached):
+				continue
+			cached.unlink(missing_ok=True)
+			deleteChunkRow(itemPath)
 	if stamp is not None:
 		for path in paths:
 			if path.is_file():
@@ -310,6 +378,22 @@ def adoptDownloadedFile(
 		size,
 		protectDirtyCache,
 	)
+
+
+def _sameFileOnDisk(first: Path, second: Path) -> bool:
+	try:
+		return first.resolve() == second.resolve()
+	except OSError:
+		return False
+
+
+def _sameContent(first: Path, second: Path) -> bool:
+	try:
+		if first.stat().st_size != second.stat().st_size:
+			return False
+		return filecmp.cmp(first, second, shallow=False)
+	except OSError:
+		return False
 
 
 def _dirtyCacheBeside(itemPath: str, local: Path) -> bool:

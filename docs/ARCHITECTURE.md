@@ -1,21 +1,27 @@
 # Arquitetura
 
 ```
-Dolphin / KRunner / CLI
-        │
-        ▼
-fastonedrive (daemon + CLI)
-        │  SQLite (índice + pins)
-        ▼
-rclone (subprocesso)
-        │
-        ▼
-Microsoft Graph (OneDrive)
+Dolphin (~/OneDrive)          KRunner / bandeja / CLI         Dolphin (fastonedrive:/search/…)
+  │  plugin de emblemas (xattr)    │                                │ worker KIO
+  │  submenu "OneDrive"            │                                │
+  ▼                                ▼                                ▼
+FUSE do perfil ──────────── fastonedrive (Python) ──────────── SQLite (índice + pins + blocos)
+  │ poll do delta (60 s)            │ subprocessos rclone (cópias, uploads, pins)
+  │ leitura Range + pré-leitura     │
+  ▼                                 ▼
+Microsoft Graph (delta, download, versões, webUrl)      rclone → Microsoft Graph
 ```
 
-Cada perfil tem o seu FUSE (`fastonedrive fuse --profile <id>` / `fast-onedrive-mount@<id>.service`): metadados no SQLite desse perfil, bytes em `profiles/<id>/pinned/` e `cache/`. O perfil migrado monta `~/OneDrive`. `rclone-onedrive.service` (5572) fica desligado. Não há RC 5573. Busca e cópia de ficheiros grandes **não** lêem o FUSE: são subprocessos rclone.
+**Um só lugar** (decisão 27): o utilizador vê o OneDrive na pasta FUSE de cada perfil (`~/OneDrive`), que é o Local do perfil no Dolphin. Cada ficheiro mostra o estado (na nuvem, neste PC, mantido, a sincronizar, conflito, erro) pelo plugin `dolphin-plugin/fastonedriveoverlay`, e o botão direito tem o submenu "OneDrive". O protocolo `fastonedrive:` continua para a busca (`fastonedrive:/search/termo`) e para cópias rápidas a partir dos resultados.
 
-Cada subprocesso rclone leva `--config` apontando ao rclone.conf do Fast-OneDrive (`~/.config/fast-onedrive/rclone.conf`) mais `--exclude` e flags extras do toml.
+Cada perfil tem o seu FUSE (`fastonedrive fuse --profile <id>` / `fast-onedrive-mount@<id>.service`, `Type=notify`): metadados no SQLite desse perfil, bytes em `profiles/<id>/pinned/` e `cache/`. O perfil migrado monta `~/OneDrive`. `rclone-onedrive.service` (5572) fica desligado. Não há RC 5573.
+
+- **Abrir um ficheiro só na nuvem:** até `openMaxBytes`, hidrata `cache/` inteiro. Acima, ficheiro sparse: cada bloco de 4 MiB vem por HTTP `Range` do URL de download do Graph (`rangeread.py`), e uma leitura sequencial pede os blocos seguintes em paralelo (`readahead.py`). Falha do Graph → `rclone cat`.
+- **Mudanças da nuvem:** o FUSE corre o índice incremental (Graph delta) a cada 60 s (`remotewatch.py`) e avisa o Dolphin; pins mudados descem logo.
+- **Estado para o Dolphin:** `getxattr(user.fastonedrive.state)` no FUSE (`search.itemStatus`); mudanças emitem `org.fastonedrive.State.Changed(as)` (`busctl --user emit`) e KDirNotify `file://`. No processo FUSE os sinais saem numa thread própria (`useAsyncSignals`), para um write não esperar pelo `busctl`; `_invalidate` emite `FilesAdded` na pasta pai.
+- **Controlo:** pausa, rede limitada, limite de banda e intervalo do poll em `sync-control.json` (`synccontrol.py`).
+
+Cada subprocesso rclone leva `--config` apontando ao rclone.conf do Fast-OneDrive (`~/.config/fast-onedrive/rclone.conf`) mais `--exclude`, `--bwlimit` e flags extras do toml.
 
 ## Componentes
 
@@ -56,7 +62,7 @@ Implementação: Python 3, pacote `fastonedrive`.
 - `open` no FUSE: até `openMaxBytes`, hydrate completo; acima, sparse file e `rclone cat --offset --count` em blocos de 4 MiB (`file_chunks` no SQLite)  
 - `put` sem `--kio-progress` / `mkdir` / `rm` / `mv`: rclone `copyto` / `mkdir` / `deletefile|purge` / `moveto` + upsert no SQLite. `put --kio-progress` grava em `pinned/` ou `cache/` e devolve; se o pai está pinado, o write-back fica em `pinned/`  
 - `sync-pins`: 3 vias com `baseModTime`/`baseEtag`; cache dirty só upload; `--path` é a raiz (os `dirty` por baixo vêm do SQLite); nunca sync da raiz do Drive  
-- `fuse`: `getattr` SQLite/disco; `readdir` TTL 15s; rename atómico sem `deletefile`; inotify em `pinned/`+`cache/`  
+- `fuse`: `getattr` SQLite/disco; `readdir` TTL 15s; `mkdir` local primeiro (pasta no disco + `upsertEntry` + `dirty`) e `rclone mkdir` em segundo plano (`_scheduleRemoteMkdir`); se a pasta já não existe quando o rclone termina, desfaz com `rmdirRemote`; falha remota põe `syncState=error` (a pasta local fica); `chmod` não chama `notifyDirChanged`; rename atómico sem `deletefile`; nomes efémeros (ex.: `.goutputstream-*`, `.~lock.*`, `*.swp`, `*.tmp`, `*.part`, `*.partial`) só locais, nunca sobem (`*.part` é efémero mas não é artefacto de staging do pin: `isStagingRel` só cobre `.partial` e `.fod-*`); inotify em `pinned/`+`cache/`; upload adiado porque o editor ainda segura o write guard volta a agendar-se (`debounceSync`) em 2 s  
 - Conversão: `file:///home/josefm/OneDrive/X` → `<remote>:X` (omissão `onedrive:`)
 - Log: `~/.local/share/fast-onedrive/fastonedrive.log` (global; erros CLI/menu/KIO; `fastonedrive log`). Índice e pins: `profiles/<id>/`.
 
@@ -112,18 +118,26 @@ Worker KF6 `fastonedrive://` (`kio/kio_fastonedrive.cpp`) chama o CLI Python; n�
 - **Cópia para fora:** Ctrl+C/V e arrastar → `copy()` → rclone (ou bytes já em `pinned/`/`cache/` completo). Ficheiro até `openMaxBytes` sem cópia local: `hydrate` para `cache/` e depois cópia local. Ficheiro acima do limiar não entra no cache por este caminho.
 - **Cópia para dentro / criar:** `put`/`copyFromFile` gravam já em `pinned/` (item ou pasta pai pinada) ou `cache/`, fazem upsert com `size`/`modTime` locais, `syncState=dirty` e o `baseEtag` anterior, notificam o Dolphin e devolvem. O envio é um `sync-pins --path` da raiz noutro processo (os filhos `dirty` saem do SQLite). `stat`/`exists` de um filho ausente só responde pelo SQLite se a listagem do pai está fechada (`listingCompleted`); se não está, lista o pai uma vez. Um `dirty` sem `baseEtag` que já existe na nuvem não faz `copyto`: QuickXor igual adopta a baseline; diferente gera conflito.
 - **Cópia dentro do Drive:** se a origem já tem bytes íntegros em `pinned/` ou `cache/`, o destino segue o mesmo write-back. Se está só na nuvem, `rclone copyto` remoto, sem `cache.lock` durante o rclone.
-- **Apagar / F2 / mkdir:** `del`/`rename`/`mkdir` → CLI rclone + SQLite.
-- **Atributos:** `chmod` grava `unixMode` no SQLite e, se já existe cópia em `pinned/` ou `cache/`, aplica `os.chmod`. Não marca dirty e não chama rclone. Sem modo gravado, ficheiro só na nuvem continua `0444` e cópia local mostra o modo do disco. O OneDrive não guarda estes bits.
+- **Apagar / F2 / mkdir:** `del`/`rename`/`mkdir` → CLI rclone + SQLite (no KIO/CLI o `mkdir` cria primeiro no remoto; no FUSE é local primeiro).
+- **Atributos:** `chmod` grava `unixMode` no SQLite e, se já existe cópia em `pinned/` ou `cache/`, aplica `os.chmod`. Não marca dirty, não chama rclone e, no FUSE, não emite `notifyDirChanged` (bloqueava a criação 5–10 s no `busctl`). Sem modo gravado, ficheiro só na nuvem continua `0444` e cópia local mostra o modo do disco. O OneDrive não guarda estes bits.
 - **Abrir (`get`):** se já há bytes completos em `pinned/` ou `cache/`, `UDS_LOCAL_PATH` + `redirection(file://)`. Até `openMaxBytes`, `hydrate` → `cache/` e o mesmo redirect. Acima, com o FUSE montado, redirect para `~/OneDrive/<path>` (o `stat`/`listDir` não publicam esse caminho, para o CopyJob não ler a ROM pelo FUSE). Duplo clique que o KIO descarrega para `/tmp` recebe um symlink para o mesmo caminho. Sem mount, a abertura grande falha e pede o FUSE. `x-scheme-handler/fastonedrive` (`open-url`) abre cache, FUSE ou pasta. Preview/thumbnail **não** hidrata.
 - **Busca:** Local “OneDrive” → `fastonedrive:/search/termo` (ou `dolphin-search`) → `listDir` no SQLite.
-- O FUSE de cada perfil não aparece no Dolphin (Locais, Dispositivos, nem a pasta na Home). Cada perfil é um Local `fastonedrive:/p/<id>/`. `fastonedrive:/` abre o perfil migrado.
-- O Ctrl+C/V em `~/OneDrive` e o Ctrl+F no mount **não** mudam (continuam FUSE / Baloo).
+- *(até 0.1)* O FUSE ficava escondido no Dolphin. Desde a decisão 27, o Local de cada perfil é a pasta FUSE; `fastonedrive:/p/<id>/` só é o Local quando o mount está desligado. `fastonedrive:/` abre o perfil migrado.
+- Ctrl+C/V em `~/OneDrive` lê pelo FUSE com pré-leitura paralela (decisão 28). O Baloo exclui a pasta (`install-kio`).
+
+### 6b. Plugins do Dolphin (`dolphin-plugin/`)
+
+- `fastonedriveoverlay` (`kf6/overlayicon`): só caminhos em montagens `fuse.fastonedrive` (lidas de `/proc/self/mountinfo`, cache 5 s). `getOverlays` devolve o estado em cache e pede o xattr num `QThreadPool` de 2 threads; o resultado chega por `overlaysChanged`. Cache de 30 s, sem guardar xattr vazio (o glifo não fica em branco); o sinal `org.fastonedrive.State.Changed` invalida o caminho e os antepassados.
+- `fastonedriveactions` (`kf6/kfileitemaction`): submenu "OneDrive" só quando todos os itens estão numa montagem. Acções: `pin`, `free-space`, `link`, `open-web`, `versions`, `dolphin-search`, `settings` (CLI em segundo plano).
+- Compilados por `install-kio` (precisa de `cmake`); a falha não é fatal.
 
 ### 7. Definições
 
 `fastonedrive settings` (PyQt). Processo de sessão: `QSystemTrayIcon` (StatusNotifierItem) na bandeja do Plasma; `settings --tray` arranca sem janela (autostart). Fechar / X esconde; Sair no ícone termina. Segunda invocação (menu Aplicativos) pede à instância a mostrar a janela (`QLocalServer` `fastonedrive-ui`). Não é plasmoid.
 
-Separador **Pesquisa**: expressão → lista do SQLite; Abrir (até `openMaxBytes`, hydrate em segundo plano se não estiver no disco; acima, abre o FUSE se estiver montado; pastas no Local), Localizar no Dolphin, Copiar (área de transferência `fastonedrive:/` / Ctrl+V no Dolphin). Hidratar não espera por `rclone copy` para fora (ex. ROMs): cadeado `cache.lock`, não o `disk.lock` da cópia. Separador **rclone**: `rclone.conf`, remotes, exclude/flags de jobs, checkbox do FUSE `~/OneDrive`. Separador **Fast-OneDrive**: bloco **Indexação**; quota `rclone about`; `openMaxBytes`, `skipPin`. Ficheiro: `~/.config/fast-onedrive/config.toml`. Progresso do job: `~/.local/share/fast-onedrive/index-status.json`. Bandeja: tooltip de actividade de sync.
+Separador **Fast-OneDrive** tem também o bloco **Sincronização** (limite de banda, pausa em rede limitada, intervalo do poll). Bandeja: Abrir pasta OneDrive, Pesquisar, Ver online, Actividade recente, Pausar 2/8/24 h / Retomar, Definições, Sair; o ícone muda com o estado.
+
+Separador **Pesquisa**: expressão → lista do SQLite (sem acentos; filtros `ext:`, `tipo:`, `em:`); Abrir (até `openMaxBytes`, hydrate em segundo plano se não estiver no disco; acima, abre o FUSE se estiver montado; pastas no Local), Localizar no Dolphin, Copiar (área de transferência `fastonedrive:/` / Ctrl+V no Dolphin). Hidratar não espera por `rclone copy` para fora (ex. ROMs): cadeado `cache.lock`, não o `disk.lock` da cópia. Separador **rclone**: `rclone.conf`, remotes, exclude/flags de jobs, checkbox do FUSE `~/OneDrive`. Separador **Fast-OneDrive**: bloco **Indexação**; quota `rclone about`; `openMaxBytes`, `skipPin`. Ficheiro: `~/.config/fast-onedrive/config.toml`. Progresso do job: `~/.local/share/fast-onedrive/index-status.json`. Bandeja: tooltip de actividade de sync.
 
 ### 8. Pacote Arch
 
@@ -147,4 +161,4 @@ Nome `fast-onedrive` → `/usr` (CLI, KIO, menus, KRunner, unidades systemd user
 - RC 5572 / `rclone-onedrive.service`
 - Overlay filesystem (union/mergerfs / segundo FUSE)
 - KFind, Ctrl+F no mount, FSearch apontado ao FUSE
-- Plugin no chrome do Dolphin (toolbar / search box nativo)
+- Plugin no chrome do Dolphin (toolbar / search box nativo). Os plugins de emblemas e de menu de contexto (6b) são extensões normais do KIO, não chrome.

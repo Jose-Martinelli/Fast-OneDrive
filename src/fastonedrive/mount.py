@@ -4,14 +4,10 @@ from pathlib import Path
 
 from fastonedrive import FastOneDriveError
 from fastonedrive import config
-from fastonedrive.menus import cliWrapperPath, pythonBin, repoBinPath
+from fastonedrive.menus import installedCliPath, pythonBin, repoBinPath
 
 LEGACY_MOUNT_UNIT: str = "rclone-onedrive.service"
 FAST_MOUNT_UNIT: str = "fast-onedrive-mount.service"
-
-
-def mountUnitPath() -> Path:
-	return Path.home() / ".config" / "systemd" / "user" / FAST_MOUNT_UNIT
 
 
 def legacyMountActive() -> bool:
@@ -84,23 +80,28 @@ def setMountEnabled(enabled: bool) -> Path:
 
 
 def applyProfileMount(profile: config.Profile) -> None:
-	from fastonedrive.kioinstall import hideFuseFromDolphin
+	from fastonedrive.kioinstall import showFuseInDolphin
 
 	stopLegacyMount()
 	if not profile.mountEnabled:
 		disableProfileMount(profile)
-		hideFuseFromDolphin()
+		showFuseInDolphin()
 		return
 	enableProfileMount(profile)
 
 
 def enableProfileMount(profile: config.Profile) -> None:
-	from fastonedrive.kioinstall import hideFuseFromDolphin
+	from fastonedrive.kioinstall import _excludeFromBaloo, showFuseInDolphin
 
 	_writeProfileUnit(profile)
 	_systemctl(["daemon-reload"])
 	_systemctl(["enable", "--now", profileUnitName(profile.id)])
-	hideFuseFromDolphin()
+	showFuseInDolphin()
+	# Instalado pelo pacote não há install-kio: sem isto o Baloo percorria a pasta FUSE.
+	try:
+		_excludeFromBaloo()
+	except (OSError, subprocess.SubprocessError):
+		pass
 
 
 def disableProfileMount(profile: config.Profile) -> None:
@@ -132,9 +133,9 @@ def _unescapeMountField(field: str) -> str:
 
 
 def fuseCommand(profileId: str = "") -> list[str]:
-	wrapper: Path = cliWrapperPath()
+	wrapper: Path | None = installedCliPath()
 	command: list[str]
-	if wrapper.is_file():
+	if wrapper is not None:
 		command = [str(wrapper), "fuse"]
 	else:
 		binary: Path = repoBinPath()
@@ -165,8 +166,13 @@ def _writeProfileUnit(profile: config.Profile) -> Path:
 		f"{conflicts}"
 		"\n"
 		"[Service]\n"
-		"Type=simple\n"
-		"ExecStartPre=/bin/sleep 1\n"
+		# O FUSE avisa o systemd (sd_notify READY=1) quando está montado.
+		"Type=notify\n"
+		"NotifyAccess=all\n"
+		"TimeoutStartSec=90\n"
+		# Parar o mount não mata um envio ou índice que o FUSE lançou: um envio
+		# interrompido deixava o ficheiro sem linha de base e gerava conflitos.
+		"KillMode=process\n"
 		f"ExecStartPre=-/usr/bin/fusermount3 -uz {_shellArg(str(mount))}\n"
 		f"ExecStart={start}\n"
 		f"ExecStop=/usr/bin/fusermount3 -uz {_shellArg(str(mount))}\n"

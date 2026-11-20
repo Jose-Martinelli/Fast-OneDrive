@@ -85,6 +85,13 @@ def runProfileWizard(parent: Any) -> bool:
 			self.typeCombo.addItem("Pessoal", "personal")
 			self.typeCombo.addItem("Empresa", "business")
 			form.addRow("Tipo de conta:", self.typeCombo)
+			self.clientIdEdit = QLineEdit()
+			self.clientIdEdit.setPlaceholderText("opcional — app Azure própria")
+			self.clientSecretEdit = QLineEdit()
+			self.clientSecretEdit.setEchoMode(QLineEdit.EchoMode.Password)
+			self.clientSecretEdit.setPlaceholderText("opcional")
+			form.addRow("Client ID:", self.clientIdEdit)
+			form.addRow("Client secret:", self.clientSecretEdit)
 			layout.addLayout(form)
 			self.driveCombo = QComboBox()
 			self.answerEdit = QLineEdit()
@@ -164,7 +171,12 @@ def runProfileWizard(parent: Any) -> bool:
 				return
 			self.profileId = allocateProfileId(name)
 			driveType: str = str(self.typeCombo.currentData() or "personal")
-			self.session = OauthSession(self.profileId, driveType)
+			self.session = OauthSession(
+				self.profileId,
+				driveType,
+				self.clientIdEdit.text(),
+				self.clientSecretEdit.text(),
+			)
 			self.question = None
 			self._setBusy(True, "A abrir o browser para entrares na Microsoft…")
 			self._runAdvance(None)
@@ -328,6 +340,8 @@ def _ensureIntegrations() -> None:
 	from fastonedrive.krunner import installRunner
 	from fastonedrive.menus import autostartDesktopPath, installMenus, serviceMenuPath
 
+	if Path("/usr/bin/fastonedrive").is_file() and not Path.home().joinpath(".local", "bin", "fastonedrive").is_file():
+		return
 	if not serviceMenuPath().is_file() or not autostartDesktopPath().is_file():
 		installMenus()
 	pluginRoot: Path = Path.home() / ".local" / "lib" / "qt6" / "plugins"

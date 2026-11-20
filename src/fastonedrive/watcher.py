@@ -4,6 +4,7 @@ import os
 import struct
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastonedrive import config
@@ -25,10 +26,16 @@ EVENT_STRUCT: str = "iIII"
 EVENT_SIZE: int = struct.calcsize(EVENT_STRUCT)
 WATCH_MASK: int = IN_CLOSE_WRITE | IN_MOVED_FROM | IN_MOVED_TO | IN_CREATE
 DEBOUNCE_SEC: float = 0.4
+# Gravações seguidas (cópia de muitos ficheiros) não adiam o envio para sempre.
+MAX_BATCH_WAIT_SEC: float = 3.0
+RETRY_SEC: float = 2.0
+MTIME_SKEW_SEC: float = 2.0
 
 _libc: ctypes.CDLL | None = None
 _timerLock: threading.Lock = threading.Lock()
-_timers: dict[str, threading.Timer] = {}
+_pendingPaths: set[str] = set()
+_pendingTimer: threading.Timer | None = None
+_batchStarted: float = 0.0
 _watchThread: threading.Thread | None = None
 
 
@@ -41,33 +48,59 @@ def _lib() -> ctypes.CDLL:
 	return _libc
 
 
-def debounceSync(itemPath: str) -> None:
+def debounceSync(itemPath: str, delay: float | None = None) -> None:
 	if itemPath == "" or isEphemeralPath(itemPath):
 		return
 	markDirty(itemPath)
+	_armBatch({itemPath}, DEBOUNCE_SEC if delay is None else delay, delay is None)
 
-	def fire(path: str = itemPath) -> None:
-		with _timerLock:
-			_timers.pop(path, None)
-		_runSync(path)
 
+def _armBatch(paths: set[str], wait: float, capped: bool) -> None:
+	global _pendingTimer, _batchStarted
 	with _timerLock:
-		previous: threading.Timer | None = _timers.get(itemPath)
-		if previous is not None:
-			previous.cancel()
-		timer: threading.Timer = threading.Timer(DEBOUNCE_SEC, fire)
+		now: float = time.monotonic()
+		if len(_pendingPaths) == 0 or _pendingTimer is None:
+			_batchStarted = now
+		_pendingPaths.update(paths)
+		if capped:
+			wait = min(wait, max(0.0, MAX_BATCH_WAIT_SEC - (now - _batchStarted)))
+		if _pendingTimer is not None:
+			_pendingTimer.cancel()
+		timer: threading.Timer = threading.Timer(wait, _fireBatch)
 		timer.daemon = True
-		_timers[itemPath] = timer
+		_pendingTimer = timer
 		timer.start()
 
 
-def _runSync(itemPath: str) -> None:
-	from fastonedrive.syncpins import syncPins
+def _fireBatch() -> None:
+	global _pendingTimer
+	with _timerLock:
+		batch: list[str] = sorted(_pendingPaths)
+		_pendingPaths.clear()
+		_pendingTimer = None
+	if len(batch) > 0:
+		_runSync(batch)
 
-	try:
-		syncPins(itemPath=itemPath)
-	except Exception as error:
-		logError(f"sync após gravação falhou: {error}", extra={"path": itemPath})
+
+def _runSync(itemPaths: list[str]) -> None:
+	from fastonedrive.disk import pinsLock
+	from fastonedrive.synccontrol import pauseReason, pauseRetryDelay
+	from fastonedrive.syncpins import _syncPinsLocked
+
+	reason: str = pauseReason()
+	if reason != "":
+		# Os caminhos ficam na fila (dirty) e sobem quando a pausa acabar, sem esperar
+		# pelo timer de 15 min.
+		retry: float = pauseRetryDelay()
+		logInfo(f"sync após gravação adiado: {reason}", extra={"paths": len(itemPaths), "retry": int(retry)})
+		_armBatch(set(itemPaths), retry, False)
+		return
+	with pinsLock():
+		for itemPath in itemPaths:
+			try:
+				_syncPinsLocked(None, itemPath)
+			except Exception as error:
+				logError(f"sync após gravação falhou: {error}", extra={"path": itemPath})
 
 
 def startLocalWatch() -> None:
@@ -181,6 +214,8 @@ def _readEvents(
 		itemPath: str | None = _itemPathFromLocal(full)
 		if itemPath is None or isSuppressed(itemPath):
 			continue
+		if (mask & IN_MOVED_TO) and not (mask & IN_CLOSE_WRITE) and _matchesBaseline(itemPath, full):
+			continue
 		debounceSync(itemPath)
 
 
@@ -202,7 +237,32 @@ def _scheduleMovedTree(root: Path) -> None:
 			pinnedHere: bool = entry is not None and bool(entry["pinned"])
 			if not pinnedHere and not pinnedLocalPath(itemPath).is_dir():
 				continue
+		elif _matchesBaseline(itemPath, path):
+			continue
 		debounceSync(itemPath)
+
+
+def _matchesBaseline(itemPath: str, path: Path) -> bool:
+	from fastonedrive.rclone import parseRemoteModTime
+
+	entry = getEntry(itemPath)
+	if entry is None or bool(entry["isDir"]):
+		return False
+	if str(entry["syncState"] or "") != "" and str(entry["syncState"]) != "synced":
+		return False
+	if str(entry["baseEtag"] or "") == "":
+		return False
+	baseTime: datetime | None = parseRemoteModTime(str(entry["baseModTime"] or ""))
+	if baseTime is None:
+		return False
+	try:
+		info: os.stat_result = path.stat()
+	except OSError:
+		return False
+	if int(info.st_size) != int(entry["size"]):
+		return False
+	localTime: datetime = datetime.fromtimestamp(info.st_mtime, tz=timezone.utc)
+	return abs((localTime - baseTime).total_seconds()) <= MTIME_SKEW_SEC
 
 
 def _itemPathFromLocal(path: Path) -> str | None:

@@ -47,26 +47,13 @@ def search(query: str, limit: int = config.SEARCH_DEFAULT_LIMIT) -> list[sqlite3
 	needle: str = query.strip()
 	if needle == "":
 		raise FastOneDriveError("busca vazia")
-	pattern: str = f"%{_escapeLike(needle)}%"
+	from fastonedrive.searchindex import SearchQuery, runSearch
+
+	if SearchQuery(needle).isEmpty():
+		raise FastOneDriveError("busca vazia")
 	connection: sqlite3.Connection = connectDb()
 	try:
-		sql: str = """
-			SELECT """ + FILE_SELECT + """
-			FROM files
-			WHERE name LIKE ? ESCAPE '\\' COLLATE NOCASE
-			   OR path LIKE ? ESCAPE '\\' COLLATE NOCASE
-			ORDER BY isDir DESC, name COLLATE NOCASE
-		"""
-		params: tuple[str, str] = (pattern, pattern)
-		if limit > 0:
-			sql += " LIMIT ?"
-			return list(
-				connection.execute(
-					sql,
-					(*params, limit),
-				)
-			)
-		return list(connection.execute(sql, params))
+		return runSearch(connection, needle, FILE_SELECT, limit)
 	finally:
 		connection.close()
 
@@ -120,9 +107,6 @@ def chmodItem(itemPath: str, mode: int) -> None:
 	for local in (pinnedLocalPath(itemPath), cacheLocalPath(itemPath)):
 		if local.is_file() or local.is_dir():
 			os.chmod(local, stored)
-	from fastonedrive.notify import notifyDirChanged
-
-	notifyDirChanged(itemPath)
 
 
 def applyStoredMode(itemPath: str, target: Path) -> None:
@@ -154,9 +138,13 @@ def _underDataRoot(rootDir: Path, itemPath: str) -> Path:
 	return target
 
 
-def rowToDict(row: sqlite3.Row) -> dict[str, Any]:
+def _statusFields(row: sqlite3.Row) -> tuple[str, bool, str, str]:
+	"""Devolve (localPath, cachedCopy, syncState, status) de uma linha do índice.
+
+	status: conflict | error | syncing | pinned | cached | cloud. É o mesmo valor que o
+	worker KIO mostra como emblema e que o FUSE expõe em ``user.fastonedrive.state``.
+	"""
 	isDir: bool = bool(row["isDir"])
-	size: int = int(row["size"])
 	pinned: bool = bool(row["pinned"])
 	itemPath: str = str(row["path"])
 	localPath: str = ""
@@ -189,6 +177,68 @@ def rowToDict(row: sqlite3.Row) -> dict[str, Any]:
 		status = "cached"
 	else:
 		status = "cloud"
+	return localPath, cachedCopy, syncState, status
+
+
+def itemStatus(itemPath: str) -> str:
+	"""Estado de um item para emblemas fora do KIO (xattr do FUSE).
+
+	Pasta: o pior estado de um descendente (conflito > erro > a sincronizar) ganha ao
+	estado da própria pasta, como no Explorer do Windows.
+	"""
+	from fastonedrive.chunks import isPartial
+
+	if itemPath == "":
+		return _worstDescendantState("")
+	row: sqlite3.Row | None = getEntry(itemPath)
+	if row is None:
+		local: Path = pinnedLocalPath(itemPath)
+		if local.exists() or cacheLocalPath(itemPath).exists():
+			return "syncing"
+		return ""
+	status: str = _statusFields(row)[3]
+	if not bool(row["isDir"]):
+		if status == "cloud" and isPartial(itemPath):
+			return "partial"
+		return status
+	if status in ("conflict", "error", "syncing"):
+		return status
+	worst: str = _worstDescendantState(itemPath)
+	return worst if worst != "" else status
+
+
+def _worstDescendantState(itemPath: str) -> str:
+	connection: sqlite3.Connection = connectDb()
+	try:
+		low: str = f"{itemPath}/" if itemPath != "" else ""
+		high: str = f"{itemPath}0" if itemPath != "" else "\U0010ffff"
+		found: set[str] = {
+			str(row[0])
+			for row in connection.execute(
+				"SELECT DISTINCT syncState FROM files WHERE path >= ? AND path < ? AND syncState IN "
+				"('conflict', 'error', 'dirty', 'syncing')",
+				(low, high),
+			)
+		}
+	finally:
+		connection.close()
+	if "conflict" in found:
+		return "conflict"
+	if "error" in found:
+		return "error"
+	if "dirty" in found or "syncing" in found:
+		return "syncing"
+	return ""
+
+
+def rowToDict(row: sqlite3.Row) -> dict[str, Any]:
+	isDir: bool = bool(row["isDir"])
+	size: int = int(row["size"])
+	pinned: bool = bool(row["pinned"])
+	localPath: str
+	syncState: str
+	status: str
+	localPath, _cached, syncState, status = _statusFields(row)
 	storedMode: int | None = storedUnixMode(row)
 	return {
 		"path": str(row["path"]),

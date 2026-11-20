@@ -1,0 +1,11 @@
+post_install() {
+	gtk-update-icon-cache -f -t /usr/share/icons/hicolor >/dev/null 2>&1 || true
+	echo "Fast-OneDrive: kbuildsycoca6 && kquitapp6 dolphin krunner"
+	echo "Definições: fastonedrive settings  (ou o ícone Fast-OneDrive no menu / bandeja)"
+	echo "Índice: systemctl --user enable --now fast-onedrive-index.timer"
+	echo "Pins:   systemctl --user enable --now fast-onedrive-sync.timer"
+}
+
+post_upgrade() {
+	post_install
+}

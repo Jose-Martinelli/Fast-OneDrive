@@ -189,6 +189,8 @@ private:
 	KIO::WorkerResult refuseIfRemoteExists(const QString &remotePath, KIO::JobFlags flags, const QUrl &url);
 	void cacheListing(const QJsonArray &children);
 	QJsonObject cachedItem(const QString &remotePath) const;
+	void forgetCachedItem(const QString &remotePath);
+	void forgetCachedPrefix(const QString &remotePath);
 
 	QHash<QString, QJsonObject> m_itemCache;
 	QString m_profileId;
@@ -297,10 +299,11 @@ QString FastOneDriveWorker::itemKioUrl(const QString &remotePath) const
 
 QString FastOneDriveWorker::itemKioUrlFor(const QString &profileId, const QString &remotePath) const
 {
+	const QString encoded = QString::fromLatin1(QUrl::toPercentEncoding(remotePath, QByteArrayLiteral("/")));
 	if (profileId.isEmpty()) {
-		return QStringLiteral("fastonedrive:/item/") + remotePath;
+		return QStringLiteral("fastonedrive:/item/") + encoded;
 	}
-	return QStringLiteral("fastonedrive:/p/") + profileId + QStringLiteral("/item/") + remotePath;
+	return QStringLiteral("fastonedrive:/p/") + profileId + QStringLiteral("/item/") + encoded;
 }
 
 bool FastOneDriveWorker::isProtectedPath(const QString &path) const
@@ -522,6 +525,32 @@ void FastOneDriveWorker::cacheListing(const QJsonArray &children)
 QJsonObject FastOneDriveWorker::cachedItem(const QString &remotePath) const
 {
 	return m_itemCache.value(remotePath);
+}
+
+void FastOneDriveWorker::forgetCachedItem(const QString &remotePath)
+{
+	if (remotePath.isEmpty()) {
+		return;
+	}
+	m_itemCache.remove(remotePath);
+}
+
+void FastOneDriveWorker::forgetCachedPrefix(const QString &remotePath)
+{
+	if (remotePath.isEmpty()) {
+		m_itemCache.clear();
+		return;
+	}
+	const QString prefix = remotePath.endsWith(QLatin1Char('/'))
+		? remotePath
+		: remotePath + QLatin1Char('/');
+	for (auto it = m_itemCache.begin(); it != m_itemCache.end();) {
+		if (it.key() == remotePath || it.key().startsWith(prefix)) {
+			it = m_itemCache.erase(it);
+		} else {
+			++it;
+		}
+	}
 }
 
 void FastOneDriveWorker::emitHelpFile()
@@ -856,7 +885,11 @@ KIO::WorkerResult FastOneDriveWorker::copy(
 		}
 		args << localPath << itemKioUrl(destItem);
 		const KIO::filesize_t total = static_cast<KIO::filesize_t>(QFileInfo(localPath).size());
-		return runCliProgress(args, total);
+		const KIO::WorkerResult copied = runCliProgress(args, total);
+		if (copied.success()) {
+			forgetCachedPrefix(destItem);
+		}
+		return copied;
 	}
 	if (src.scheme() == QStringLiteral("fastonedrive") && dest.scheme() == QStringLiteral("fastonedrive")) {
 		if (isProtectedPath(normalizedPath(dest))) {
@@ -887,7 +920,11 @@ KIO::WorkerResult FastOneDriveWorker::copy(
 			args << QStringLiteral("--overwrite");
 		}
 		args << itemKioUrlFor(srcProfile, srcItem) << itemKioUrlFor(destProfile, destItem);
-		return runCliProgress(args, 0);
+		const KIO::WorkerResult copied = runCliProgress(args, 0);
+		if (copied.success()) {
+			forgetCachedPrefix(destItem);
+		}
+		return copied;
 	}
 	if (dest.scheme() != QStringLiteral("file")) {
 		return KIO::WorkerResult::fail(
@@ -918,6 +955,12 @@ KIO::WorkerResult FastOneDriveWorker::copy(
 	const QString localPath = item.value(QStringLiteral("localPath")).toString();
 	if (!localPath.isEmpty()) {
 		return copyLocalPath(localPath, destPath, flags);
+	}
+	if (isPreviewRequest()) {
+		return KIO::WorkerResult::fail(
+			KIO::ERR_CANNOT_OPEN_FOR_READING,
+			src.toDisplayString()
+		);
 	}
 	const bool isDir = item.value(QStringLiteral("isDir")).toBool();
 	const bool tooLarge = item.value(QStringLiteral("tooLargeToOpen")).toBool();
@@ -994,12 +1037,16 @@ KIO::WorkerResult FastOneDriveWorker::chmod(const QUrl &url, int permissions)
 		return KIO::WorkerResult::pass();
 	}
 	const QString mode = QString::number(permissions & 0777, 8).rightJustified(4, QLatin1Char('0'));
-	return runCli(
+	const KIO::WorkerResult result = runCli(
 		QStringList()
 			<< QStringLiteral("chmod")
 			<< mode
 			<< itemKioUrl(remote)
 	);
+	if (result.success()) {
+		forgetCachedItem(remote);
+	}
+	return result;
 }
 
 bool FastOneDriveWorker::isPreviewRequest() const
@@ -1260,7 +1307,11 @@ KIO::WorkerResult FastOneDriveWorker::put(const QUrl &url, int permissions, KIO:
 		args << QStringLiteral("--overwrite");
 	}
 	args << tmp.fileName() << itemKioUrl(remotePath);
-	return runCliProgress(args, total);
+	const KIO::WorkerResult putResult = runCliProgress(args, total);
+	if (putResult.success()) {
+		forgetCachedPrefix(remotePath);
+	}
+	return putResult;
 }
 
 KIO::WorkerResult FastOneDriveWorker::mkdir(const QUrl &url, int permissions)
@@ -1274,12 +1325,16 @@ KIO::WorkerResult FastOneDriveWorker::mkdir(const QUrl &url, int permissions)
 	if (remotePath.isEmpty()) {
 		return KIO::WorkerResult::fail(KIO::ERR_CANNOT_MKDIR, url.toDisplayString());
 	}
-	return runCli(
+	const KIO::WorkerResult result = runCli(
 		QStringList()
 			<< QStringLiteral("mkdir")
 			<< QStringLiteral("--notify")
 			<< itemKioUrl(remotePath)
 	);
+	if (result.success()) {
+		forgetCachedItem(remotePath);
+	}
+	return result;
 }
 
 KIO::WorkerResult FastOneDriveWorker::del(const QUrl &url, bool isfile)
@@ -1300,7 +1355,11 @@ KIO::WorkerResult FastOneDriveWorker::del(const QUrl &url, bool isfile)
 		args << QStringLiteral("--dir");
 	}
 	args << itemKioUrl(remotePath);
-	return runCli(args);
+	const KIO::WorkerResult result = runCli(args);
+	if (result.success()) {
+		forgetCachedPrefix(remotePath);
+	}
+	return result;
 }
 
 KIO::WorkerResult FastOneDriveWorker::rename(const QUrl &src, const QUrl &dest, KIO::JobFlags flags)
@@ -1336,7 +1395,12 @@ KIO::WorkerResult FastOneDriveWorker::rename(const QUrl &src, const QUrl &dest, 
 		args << QStringLiteral("--overwrite");
 	}
 	args << itemKioUrlFor(srcProfile, srcItem) << itemKioUrlFor(destProfile, destItem);
-	return runCli(args);
+	const KIO::WorkerResult result = runCli(args);
+	if (result.success()) {
+		forgetCachedPrefix(srcItem);
+		forgetCachedPrefix(destItem);
+	}
+	return result;
 }
 
 KIO::WorkerResult FastOneDriveWorker::refuseIfRemoteExists(

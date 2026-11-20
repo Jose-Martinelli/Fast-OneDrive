@@ -1,6 +1,9 @@
+import queue
 import shutil
 import subprocess
+import threading
 from collections.abc import Callable
+from pathlib import Path
 from typing import TypeVar
 from urllib.parse import quote
 
@@ -80,7 +83,147 @@ def notifyDirChanged(itemPath: str) -> None:
 	profile: config.Profile | None = config.activeProfile()
 	if profile is not None and profile.legacy:
 		urls.extend(_itemUrls(itemPath, config.KIO_SCHEME + ":"))
-	_emitKdirNotify(urls)
+	# A mesma mudança vista na pasta FUSE (~/OneDrive): o Dolphin não recebe inotify
+	# de um FUSE, e o plugin de emblemas espera o sinal org.fastonedrive.State.
+	mount: Path = config.mountPath()
+	local: str = str(mount / itemPath) if itemPath != "" else str(mount)
+	parent: str = str(Path(local).parent) if itemPath != "" else local
+	urls.extend(_fileUrls([parent, local] if parent != local else [local]))
+	_runAsync(lambda: _emitKdirNotify(urls))
+	emitStateChanged([local])
+
+
+def notifyConflict(itemPath: str) -> None:
+	"""Como no Windows: avisar que há duas versões, sem esperar que o utilizador repare no emblema."""
+	name: str = itemPath.rsplit("/", 1)[-1]
+	notify(
+		"OneDrive: conflito de sincronização",
+		f"{name} mudou aqui e na nuvem. As duas versões foram guardadas; "
+		"a cópia local tem «(conflito local …)» no nome.",
+	)
+
+
+def notifyStateChanged(itemPath: str) -> None:
+	"""Só o emblema mudou (dirty → synced, por ex.): avisa o plugin, sem relistar a pasta."""
+	from fastonedrive import config
+
+	mount: Path = config.mountPath()
+	emitStateChanged([str(mount / itemPath) if itemPath != "" else str(mount)])
+
+
+def notifyLocalDirsChanged(localDirs: list[str]) -> None:
+	"""Pastas locais (dentro de uma montagem) cujo conteúdo mudou na nuvem."""
+	if len(localDirs) == 0:
+		return
+	# FilesAdded(pasta) faz o Dolphin relistar a pasta (ficheiros novos e apagados);
+	# FilesChanged só refresca os itens que já conhece.
+	urls: list[str] = _fileUrls(localDirs)
+
+	def emitAdded() -> None:
+		url: str
+		for url in urls:
+			_emitDirListingChanged(url)
+
+	_runAsync(emitAdded)
+	emitStateChanged(localDirs)
+
+
+def _emitDirListingChanged(dirUrl: str) -> None:
+	busctl: str | None = shutil.which("busctl")
+	if busctl is None:
+		return
+	try:
+		subprocess.run(
+			[busctl, "--user", "emit", "/org/kde/KDirNotify", "org.kde.KDirNotify", "FilesAdded", "s", dirUrl],
+			check=False,
+			capture_output=True,
+			timeout=5,
+		)
+	except (OSError, subprocess.TimeoutExpired):
+		return
+
+
+def _fileUrls(paths: list[str]) -> list[str]:
+	return [Path(item).as_uri() for item in paths if item.startswith("/")]
+
+
+_asyncJobs: "queue.SimpleQueue[Callable[[], None]] | None" = None
+
+
+def useAsyncSignals() -> None:
+	"""No processo FUSE (longo) os sinais saem numa thread: um write não espera pelo busctl."""
+	global _asyncJobs
+	if _asyncJobs is not None:
+		return
+	_asyncJobs = queue.SimpleQueue()
+	threading.Thread(target=_notifyWorker, args=(_asyncJobs,), name="fod-signals", daemon=True).start()
+
+
+def _notifyWorker(pending: "queue.SimpleQueue[Callable[[], None]]") -> None:
+	while True:
+		job: Callable[[], None] = pending.get()
+		_runJob(job)
+		while True:
+			try:
+				extra: Callable[[], None] = pending.get_nowait()
+			except queue.Empty:
+				break
+			_runJob(extra)
+
+
+def _runJob(job: Callable[[], None]) -> None:
+	# Uma excepção num sinal matava a thread: daí em diante nenhum emblema nem
+	# relistagem chegava ao Dolphin até reiniciar o FUSE.
+	try:
+		job()
+	except Exception as error:  # noqa: BLE001
+		from fastonedrive.log import logError
+
+		logError(f"sinal D-Bus falhou: {error}")
+
+
+def _runAsync(job: Callable[[], None]) -> None:
+	if _asyncJobs is not None:
+		_asyncJobs.put(job)
+		return
+	job()
+
+
+def emitStateChanged(localPaths: list[str]) -> None:
+	"""Sinal org.fastonedrive.State.Changed(as) para o plugin de emblemas do Dolphin."""
+	paths: list[str] = [item for item in localPaths if item.startswith("/")]
+	if len(paths) == 0:
+		return
+	_runAsync(lambda: _sendStateChanged(paths))
+
+
+def _sendStateChanged(paths: list[str]) -> None:
+	busctl: str | None = shutil.which("busctl")
+	if busctl is None:
+		return
+	try:
+		_runBusctl(busctl, paths)
+	except (OSError, subprocess.TimeoutExpired):
+		return
+
+
+def _runBusctl(busctl: str, paths: list[str]) -> None:
+	subprocess.run(
+		[
+			busctl,
+			"--user",
+			"emit",
+			"/org/fastonedrive/State",
+			"org.fastonedrive.State",
+			"Changed",
+			"as",
+			str(len(paths)),
+			*paths,
+		],
+		check=False,
+		capture_output=True,
+		timeout=5,
+	)
 
 
 def _itemUrls(itemPath: str, root: str) -> list[str]:
@@ -120,17 +263,30 @@ def _kioRoot() -> str:
 def _emitKdirNotify(urls: list[str]) -> None:
 	if len(urls) == 0:
 		return
-	qdbus: str | None = shutil.which("qdbus") or shutil.which("qdbus6")
-	if qdbus is not None:
+	busctl: str | None = shutil.which("busctl")
+	if busctl is not None:
 		command: list[str] = [
-			qdbus,
-			"org.kde.KDirNotify",
+			busctl,
+			"--user",
+			"emit",
 			"/org/kde/KDirNotify",
-			"org.kde.KDirNotify.FilesChanged",
+			"org.kde.KDirNotify",
+			"FilesChanged",
+			"as",
+			str(len(urls)),
 			*urls,
 		]
-		subprocess.run(command, check=False, capture_output=True)
-		return
+		try:
+			result: subprocess.CompletedProcess[bytes] = subprocess.run(
+				command,
+				check=False,
+				capture_output=True,
+				timeout=5,
+			)
+			if result.returncode == 0:
+				return
+		except (OSError, subprocess.TimeoutExpired):
+			pass
 	dbus: str | None = shutil.which("dbus-send")
 	if dbus is None:
 		return
@@ -143,7 +299,15 @@ def _emitKdirNotify(urls: list[str]) -> None:
 		"org.kde.KDirNotify.FilesChanged",
 		"array:string:" + ",".join(encoded),
 	]
-	subprocess.run(args, check=False, capture_output=True)
+	try:
+		subprocess.run(
+			args,
+			check=False,
+			capture_output=True,
+			timeout=5,
+		)
+	except (OSError, subprocess.TimeoutExpired):
+		return
 
 
 def runNotified(title: str, startBody: str, action: Callable[[NotifyJob], T]) -> T:

@@ -3,12 +3,15 @@ import sqlite3
 import threading
 from pathlib import Path
 
-from fastonedrive import FastOneDriveError
 from fastonedrive.index import connectDb
-from fastonedrive.rclone import catRange
+from fastonedrive.rangeread import fetchRange
 from fastonedrive.search import applyStoredMode, cacheLocalPath
 
 CHUNK_SIZE: int = 4 * 1024 * 1024
+# Um pedido nunca passa de 16 blocos (64 MiB): o fillHoles de um ficheiro grande
+# deixava de carregar o ficheiro inteiro em memória.
+MAX_SPAN_CHUNKS: int = 16
+_bitmapGuard: threading.Lock = threading.Lock()
 _chunkLocks: dict[tuple[str, int], threading.Lock] = {}
 _chunkLockGuard: threading.Lock = threading.Lock()
 _pendingWrites: dict[str, list[tuple[int, int]]] = {}
@@ -60,6 +63,8 @@ def isPartial(itemPath: str) -> bool:
 def deleteChunkRow(itemPath: str) -> None:
 	if itemPath == "":
 		return
+	with _chunkLockGuard:
+		_pendingWrites.pop(itemPath, None)
 	connection: sqlite3.Connection = connectDb()
 	try:
 		connection.execute("DELETE FROM file_chunks WHERE path = ?", (itemPath,))
@@ -67,6 +72,43 @@ def deleteChunkRow(itemPath: str) -> None:
 		connection.commit()
 	finally:
 		connection.close()
+
+
+def deleteChunkTree(itemPath: str) -> None:
+	if itemPath == "":
+		return
+	prefix: str = f"{itemPath}/"
+	with _chunkLockGuard:
+		for key in [key for key in _pendingWrites if key == itemPath or key.startswith(prefix)]:
+			_pendingWrites.pop(key, None)
+	like: str = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+	connection: sqlite3.Connection = connectDb()
+	try:
+		for table in ("file_chunks", "chunk_writes"):
+			connection.execute(
+				f"DELETE FROM {table} WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+				(itemPath, like),
+			)
+		connection.commit()
+	finally:
+		connection.close()
+
+
+def truncatePartial(itemPath: str, remotePath: str, fd: int, length: int) -> None:
+	if not isPartial(itemPath):
+		os.ftruncate(fd, length)
+		return
+	if length > 0:
+		ensureRange(
+			itemPath,
+			remotePath,
+			fd,
+			0,
+			length,
+			int(os.fstat(fd).st_size),
+		)
+	os.ftruncate(fd, length)
+	deleteChunkRow(itemPath)
 
 
 def prepareSparse(itemPath: str, remoteSize: int, etag: str) -> Path:
@@ -89,6 +131,8 @@ def prepareSparse(itemPath: str, remoteSize: int, etag: str) -> Path:
 		current: int = int(os.fstat(fd).st_size)
 		if current < remoteSize:
 			os.ftruncate(fd, remoteSize)
+		elif current > remoteSize and not _cacheIsDirty(itemPath):
+			os.ftruncate(fd, remoteSize)
 		if stamp is None:
 			stamp = _remoteStamp(itemPath)
 		from fastonedrive.disk import suppressPath
@@ -109,7 +153,28 @@ def prepareSparse(itemPath: str, remoteSize: int, etag: str) -> Path:
 			remoteSize,
 			bytes(_byteCount(_chunkCount(remoteSize))),
 		)
+		_adoptRemoteBaseline(itemPath, etag)
 	return target
+
+
+def _adoptRemoteBaseline(itemPath: str, etag: str) -> None:
+	"""A cópia a pedido nasce da versão `etag` da nuvem: essa é a sua linha de base.
+
+	Sem isto, editar um ficheiro aberto a pedido (cache sem baseEtag) chegava ao sync
+	como "local novo que também existe na nuvem" e gerava uma cópia de conflito.
+	"""
+	from fastonedrive.index import getEntry, setBaseline
+
+	if etag == "":
+		return
+	entry = getEntry(itemPath)
+	if entry is None or bool(entry["pinned"]):
+		return
+	from fastonedrive.rclone import sameToken
+
+	if str(entry["baseEtag"] or "") != "" or not sameToken(str(entry["etag"] or ""), etag):
+		return
+	setBaseline(itemPath, str(entry["modTime"] or ""), etag, keepSyncState=True)
 
 
 def noteWrite(itemPath: str, offset: int, length: int) -> None:
@@ -120,7 +185,7 @@ def noteWrite(itemPath: str, offset: int, length: int) -> None:
 	_storePendingWrite(itemPath, offset, length)
 
 
-def chunkLocks(itemPath: str, first: int, last: int) -> object:
+def chunkLocks(itemPath: str, first: int, last: int) -> "_ChunkGuard":
 	return _ChunkGuard(itemPath, first, last)
 
 
@@ -231,7 +296,12 @@ def _fillSpan(
 				index += 1
 				continue
 			endIndex: int = index
-			while endIndex + 1 <= last and endIndex + 1 < total and not _bitIsSet(bitmap, endIndex + 1):
+			while (
+				endIndex + 1 <= last
+				and endIndex + 1 < total
+				and endIndex - index + 1 < MAX_SPAN_CHUNKS
+				and not _bitIsSet(bitmap, endIndex + 1)
+			):
 				nextOffset: int = (endIndex + 1) * CHUNK_SIZE
 				if nextOffset >= fileSize:
 					break
@@ -247,20 +317,59 @@ def _fillSpan(
 					_setBit(bitmap, bit)
 				_dropPending(itemPath, chunkOffset, spanEnd)
 			else:
-				downloaded: bytes = catRange(remotePath, chunkOffset, spanLength)
+				downloaded: bytes = fetchRange(itemPath, remotePath, chunkOffset, spanLength)
 				merged: bytearray = bytearray(downloaded)
 				_overlayWrites(fd, merged, chunkOffset, coveredBy)
 				os.pwrite(fd, bytes(merged), chunkOffset)
 				for bit in range(index, endIndex + 1):
 					_setBit(bitmap, bit)
 				_dropPending(itemPath, chunkOffset, spanEnd)
+			if _markChunks(itemPath, etag, range(index, endIndex + 1)):
+				return
 			index = endIndex + 1
-		if not _hasHole(bitmap, total, fileSize):
-			deleteChunkRow(itemPath)
-			return
-		_saveRow(itemPath, etag, storedSize, bytes(bitmap))
+		_markChunks(itemPath, etag, range(0))
 	finally:
 		_restoreFdTime(fd, stamp)
+
+
+def _markChunks(itemPath: str, etag: str, bits: range) -> bool:
+	"""Grava os blocos concluídos sobre o bitmap actual do SQLite.
+
+	Várias threads (leitura e pré-leitura) enchem blocos diferentes do mesmo ficheiro;
+	cada uma relê o bitmap antes de gravar, para não apagar o bit de outra. Devolve
+	True quando o ficheiro ficou completo (a linha sai e passa a cache normal).
+	"""
+	with _bitmapGuard:
+		row: tuple[str, int, bytes] | None = _loadRow(itemPath)
+		if row is None:
+			return True
+		if row[0] != etag:
+			return False
+		storedSize: int = int(row[1])
+		bitmap: bytearray = bytearray(row[2])
+		total: int = _chunkCount(storedSize)
+		for bit in bits:
+			if 0 <= bit < total:
+				_setBit(bitmap, bit)
+		if not _hasHole(bitmap, total, storedSize):
+			deleteChunkRow(itemPath)
+			from fastonedrive.notify import notifyStateChanged
+
+			# Ficheiro completo: o emblema passa de "na nuvem" a "neste PC".
+			notifyStateChanged(itemPath)
+			return True
+		if bytes(bitmap) != row[2]:
+			_saveRow(itemPath, etag, storedSize, bytes(bitmap))
+		return False
+
+
+def holesIn(itemPath: str, first: int, last: int) -> list[int]:
+	"""Índices de blocos ainda por descarregar entre first e last (inclusive)."""
+	row: tuple[str, int, bytes] | None = _loadRow(itemPath)
+	if row is None:
+		return []
+	total: int = _chunkCount(int(row[1]))
+	return [index for index in range(max(0, first), min(last, total - 1) + 1) if not _bitIsSet(row[2], index)]
 
 
 def _withChunkLocks(

@@ -253,7 +253,7 @@ def _runRcloneAbout(command: list[str]) -> None:
 		encoding="utf-8",
 	)
 	if result.returncode != 0:
-		detail: str = (result.stderr or result.stdout or "").strip().splitlines()
+		detail: list[str] = (result.stderr or result.stdout or "").strip().splitlines()
 		last: str = detail[-1] if detail else f"código {result.returncode}"
 		raise GraphDeltaError(f"falha a renovar o token rclone: {last}")
 
@@ -273,10 +273,13 @@ def _tokenPayload() -> dict[str, Any]:
 
 def _remoteField(key: str) -> str:
 	config.ensureRcloneConfig()
+	from fastonedrive.secretconf import readConfigText
+
 	parser: configparser.RawConfigParser = configparser.RawConfigParser()
-	read: list[str] = parser.read(str(config.rcloneConfigPath()), encoding="utf-8")
-	if not read:
-		raise GraphDeltaError("rclone.conf ilegível")
+	try:
+		parser.read_string(readConfigText())
+	except (OSError, configparser.Error, FastOneDriveError) as error:
+		raise GraphDeltaError(f"rclone.conf ilegível: {error}") from error
 	section: str = config.remoteName()
 	if not parser.has_section(section):
 		raise GraphDeltaError(f"remote {section} não encontrado no rclone.conf")

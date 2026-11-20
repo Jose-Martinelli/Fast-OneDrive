@@ -6,13 +6,76 @@ from pathlib import Path
 from fastonedrive import FastOneDriveError
 from fastonedrive import config
 
+APP_ICON_NAME: str = "fastonedrive"
+_ICON_SIZES: tuple[str, ...] = ("16", "22", "24", "32", "48", "64", "128", "256", "512")
+
+
+def repoRoot() -> Path:
+	return Path(__file__).resolve().parent.parent.parent
+
 
 def repoBinPath() -> Path:
-	return Path(__file__).resolve().parent.parent.parent / "bin" / "fastonedrive"
+	return repoRoot() / "bin" / "fastonedrive"
+
+
+def repoIconSource() -> Path:
+	return repoRoot() / "icon.png"
+
+
+def repoHicolorIconsDir() -> Path:
+	return repoRoot() / "icons" / "hicolor"
+
+
+def userHicolorIconsDir() -> Path:
+	return Path.home() / ".local" / "share" / "icons" / "hicolor"
+
+
+def appIconPath() -> Path | None:
+	"""Melhor PNG disponível para a app (tema local, sistema ou repo)."""
+	candidates: list[Path] = []
+	for size in ("256", "128", "512", "64", "48"):
+		candidates.append(userHicolorIconsDir() / f"{size}x{size}" / "apps" / f"{APP_ICON_NAME}.png")
+		candidates.append(Path("/usr/share/icons/hicolor") / f"{size}x{size}" / "apps" / f"{APP_ICON_NAME}.png")
+		candidates.append(repoHicolorIconsDir() / f"{size}x{size}" / "apps" / f"{APP_ICON_NAME}.png")
+	candidates.append(repoIconSource())
+	for path in candidates:
+		if path.is_file():
+			return path
+	return None
+
+
+def installAppIcons() -> Path:
+	sourceRoot: Path = repoHicolorIconsDir()
+	if not sourceRoot.is_dir():
+		raise FastOneDriveError(f"ícones não encontrados: {sourceRoot}")
+	destRoot: Path = userHicolorIconsDir()
+	installed: int = 0
+	for size in _ICON_SIZES:
+		src: Path = sourceRoot / f"{size}x{size}" / "apps" / f"{APP_ICON_NAME}.png"
+		if not src.is_file():
+			continue
+		dest: Path = destRoot / f"{size}x{size}" / "apps" / f"{APP_ICON_NAME}.png"
+		dest.parent.mkdir(parents=True, exist_ok=True)
+		shutil.copy2(src, dest)
+		installed += 1
+	if installed == 0:
+		raise FastOneDriveError(f"nenhum ícone {APP_ICON_NAME}.png em {sourceRoot}")
+	_updateIconCache(destRoot.parent)
+	return destRoot
 
 
 def cliWrapperPath() -> Path:
 	return Path.home() / ".local" / "bin" / "fastonedrive"
+
+
+def installedCliPath() -> Path | None:
+	wrapper: Path = cliWrapperPath()
+	if wrapper.is_file():
+		return wrapper
+	system: Path = Path("/usr/bin/fastonedrive")
+	if system.is_file():
+		return system
+	return None
 
 
 def pythonBin() -> str:
@@ -30,7 +93,7 @@ def serviceMenuHelperPath() -> Path:
 
 
 def repoServiceMenuHelper() -> Path:
-	return Path(__file__).resolve().parent.parent.parent / "dolphin" / "servicemenu.py"
+	return repoRoot() / "dolphin" / "servicemenu.py"
 
 
 def writeInstalledText(path: Path, body: str, mode: int) -> None:
@@ -88,7 +151,7 @@ def settingsDesktopPath() -> Path:
 
 
 def repoSettingsDesktop() -> Path:
-	return Path(__file__).resolve().parent.parent.parent / "dolphin" / "fast-onedrive-settings.desktop"
+	return repoRoot() / "dolphin" / "fast-onedrive-settings.desktop"
 
 
 def autostartDir() -> Path:
@@ -100,7 +163,7 @@ def autostartDesktopPath() -> Path:
 
 
 def repoAutostartDesktop() -> Path:
-	return Path(__file__).resolve().parent.parent.parent / "dolphin" / "fast-onedrive-autostart.desktop"
+	return repoRoot() / "dolphin" / "fast-onedrive-autostart.desktop"
 
 
 def pickDestDir() -> str:
@@ -155,7 +218,7 @@ def schemeHandlerPath() -> Path:
 
 
 def schemeHandlerTemplate() -> Path:
-	return Path(__file__).resolve().parent.parent.parent / "dolphin" / "fast-onedrive-open.desktop"
+	return repoRoot() / "dolphin" / "fast-onedrive-open.desktop"
 
 
 def installSchemeHandler(binary: Path) -> Path:
@@ -182,7 +245,7 @@ def installMenus() -> Path:
 	config.ensureUserConfig()
 	binary: Path = installCliWrapper()
 	helper: Path = installServiceMenuHelper()
-	template: Path = Path(__file__).resolve().parent.parent.parent / "dolphin" / "fast-onedrive.desktop"
+	template: Path = repoRoot() / "dolphin" / "fast-onedrive.desktop"
 	if not template.is_file():
 		raise FastOneDriveError(f"template de menu não encontrado: {template}")
 	text: str = (
@@ -196,6 +259,7 @@ def installMenus() -> Path:
 		text,
 		0o755,
 	)
+	installAppIcons()
 	installSettingsDesktop(binary)
 	installAutostartDesktop(binary)
 	installSchemeHandler(binary)
@@ -205,6 +269,17 @@ def installMenus() -> Path:
 
 def rebuildSycoca() -> None:
 	_rebuildSycoca()
+
+
+def _updateIconCache(iconsDir: Path) -> None:
+	binary: str | None = shutil.which("gtk-update-icon-cache")
+	if binary is None:
+		return
+	subprocess.run(
+		[binary, "-f", "-t", str(iconsDir / "hicolor")],
+		check=False,
+		capture_output=True,
+	)
 
 
 def _rebuildSycoca() -> None:

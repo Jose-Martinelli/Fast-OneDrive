@@ -3,7 +3,7 @@ import shutil
 import subprocess
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from urllib.parse import ParseResult, quote, unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from fastonedrive import FastOneDriveError
 from fastonedrive import config
@@ -47,7 +47,7 @@ def runDolphinSearch() -> str:
 	dolphin: str | None = shutil.which("dolphin")
 	if dolphin is None:
 		raise FastOneDriveError("dolphin não encontrado")
-	opened: subprocess.CompletedProcess[str] = subprocess.run(
+	opened: subprocess.CompletedProcess[bytes] = subprocess.run(
 		[dolphin, url],
 		check=False,
 		env=_pluginEnv(),
@@ -64,8 +64,18 @@ def installKio() -> Path:
 	pluginPath: Path = _buildAndInstallWorker()
 	_installPluginEnv()
 	_installPlace()
-	hideFuseFromDolphin()
+	showFuseInDolphin()
+	_buildDolphinPlugins()
+	_excludeFromBaloo()
 	rebuildSycoca()
+	if str(_qtPluginRoot()) not in os.environ.get("QT_PLUGIN_PATH", "").split(":"):
+		# Instalação em ~/.local: o Dolphin só vê os plugins (emblemas, submenu) com o
+		# QT_PLUGIN_PATH novo, que a sessão Plasma lê ao entrar. O pacote instala em
+		# /usr e não precisa disto.
+		print(
+			"Aviso: termine a sessão e volte a entrar (ou reinicie) para o Dolphin carregar "
+			"os emblemas e o submenu OneDrive."
+		)
 	return pluginPath
 
 
@@ -152,6 +162,85 @@ def _installPluginEnv() -> None:
 	)
 
 
+def _buildDolphinPlugins() -> None:
+	"""Emblemas e submenu "OneDrive" para ~/OneDrive (precisa de cmake e kf6-kio).
+
+	Não é fatal: sem estes plugins a pasta continua a funcionar, só sem emblemas.
+	"""
+	from fastonedrive.log import logError
+
+	source: Path = Path(__file__).resolve().parent.parent.parent / "dolphin-plugin"
+	if not (source / "CMakeLists.txt").is_file():
+		return
+	prefix: Path = Path.home() / ".local"
+	make: str | None = shutil.which("make")
+	cmake: str | None = shutil.which("cmake")
+	errors: list[str] = []
+	# Primeiro o Makefile (o mesmo caminho que já compila o worker KIO nesta máquina);
+	# se falhar, o cmake.
+	if make is not None and (source / "Makefile").is_file():
+		try:
+			_buildPluginsWithMake(make, source, prefix)
+			print(f"Plugins do Dolphin instalados em {prefix / 'lib' / 'qt6' / 'plugins' / 'kf6'}")
+			return
+		except FastOneDriveError as error:
+			errors.append(f"make: {error}")
+	if cmake is not None:
+		try:
+			_buildWithCmake(cmake, source, prefix)
+			print(f"Plugins do Dolphin instalados em {prefix / 'lib' / 'qt6' / 'plugins' / 'kf6'}")
+			return
+		except FastOneDriveError as error:
+			errors.append(f"cmake: {error}")
+	if len(errors) == 0:
+		errors.append("nem make nem cmake encontrados")
+	detail: str = "\n".join(errors)
+	logError(f"plugins do Dolphin não compilaram:\n{detail}")
+	print(f"Aviso: plugins do Dolphin não compilaram (emblemas e submenu OneDrive):\n{detail}")
+
+
+def _buildPluginsWithMake(make: str, source: Path, prefix: Path) -> None:
+	env: dict[str, str] = os.environ.copy()
+	env["PATH"] = "/usr/bin:/bin:" + env.get("PATH", "")
+	env["CXX"] = "/usr/bin/g++"
+	env["MOC"] = "/usr/lib/qt6/moc"
+	result: subprocess.CompletedProcess[str] = subprocess.run(
+		[
+			make,
+			"-C",
+			str(source),
+			f"PREFIX={prefix}",
+			f"PLUGINROOT={prefix / 'lib' / 'qt6' / 'plugins' / 'kf6'}",
+			"install",
+		],
+		check=False,
+		capture_output=True,
+		text=True,
+		encoding="utf-8",
+		env=env,
+		timeout=300,
+	)
+	if result.returncode != 0:
+		raise FastOneDriveError(_buildErrorSummary(result.stderr or result.stdout or "", "make", result.returncode))
+
+
+def _excludeFromBaloo() -> None:
+	"""O Baloo a indexar ~/OneDrive leria o FUSE (e descarregaria ficheiros)."""
+	balooctl: str | None = shutil.which("balooctl6") or shutil.which("balooctl")
+	if balooctl is None:
+		return
+	mounts: list[Path] = [Path(profile.mountPath).expanduser() for profile in config.listProfiles()]
+	if len(mounts) == 0:
+		mounts.append(config.mountPath())
+	for mount in mounts:
+		subprocess.run(
+			[balooctl, "config", "add", "excludeFolders", str(mount)],
+			check=False,
+			capture_output=True,
+			timeout=20,
+		)
+
+
 def _buildAndInstallWorker() -> Path:
 	source: Path = Path(__file__).resolve().parent.parent.parent / "kio"
 	if not (source / "CMakeLists.txt").is_file() and not (source / "Makefile").is_file():
@@ -233,10 +322,24 @@ def _runCmake(command: list[str]) -> None:
 	except subprocess.TimeoutExpired as error:
 		raise FastOneDriveError("cmake excedeu o tempo") from error
 	if result.returncode != 0:
-		detail: str = (result.stderr or result.stdout or "").strip()
-		if detail == "":
-			raise FastOneDriveError(f"cmake saiu com código {result.returncode}")
-		raise FastOneDriveError(detail.splitlines()[-1])
+		raise FastOneDriveError(
+			_buildErrorSummary((result.stderr or "") + "\n" + (result.stdout or ""), "cmake", result.returncode)
+		)
+
+
+def _buildErrorSummary(output: str, tool: str, code: int) -> str:
+	"""As linhas que explicam a falha (CMake Error / error:), não só a última da pilha."""
+	lines: list[str] = [line.rstrip() for line in output.splitlines() if line.strip() != ""]
+	if len(lines) == 0:
+		return f"{tool} saiu com código {code}"
+	picked: list[str] = []
+	for index, line in enumerate(lines):
+		lowered: str = line.lower()
+		if "cmake error" in lowered or " error:" in lowered or lowered.startswith("error") or "fatal error" in lowered:
+			picked.extend(lines[index : index + 4])
+	if len(picked) == 0:
+		picked = lines[-6:]
+	return "\n".join(dict.fromkeys(picked))[:2000]
 
 
 def _findPlugin(prefix: Path) -> Path | None:
@@ -255,20 +358,45 @@ def _installPlace() -> None:
 		upsertProfilePlace(profile)
 
 
-def hideFuseFromDolphin() -> None:
+def showFuseInDolphin() -> None:
+	"""Um só lugar no Dolphin: a pasta FUSE de cada perfil (~/OneDrive), como no Windows.
+
+	Desfaz o que versões anteriores faziam (esconder a pasta em ~/.hidden e trocar os
+	marcadores file:// por fastonedrive:/…). O Local de cada perfil aponta para a pasta
+	FUSE quando o mount está ligado; sem mount, continua em fastonedrive:/p/<id>/.
+	A busca continua no protocolo (fastonedrive:/search/…), no KRunner e na janela.
+	"""
 	profiles: list[config.Profile] = config.listProfiles()
-	if len(profiles) == 0:
-		_hideMountInHome(config.mountPath())
-	else:
-		for profile in profiles:
-			_hideMountInHome(Path(profile.mountPath))
+	mounts: list[Path] = [Path(profile.mountPath).expanduser() for profile in profiles]
+	if len(mounts) == 0:
+		mounts.append(config.mountPath())
+	for mount in mounts:
+		_unhideMountInHome(mount)
 	places: Path = Path.home() / ".local" / "share" / "user-places.xbel"
-	if places.is_file():
-		_rewriteFusePlaces(places)
+	if not places.is_file():
+		return
+	for profile in profiles:
+		upsertProfilePlace(profile)
+	_rewriteKioItemPlaces(places)
+
+
+def placeHref(profile: config.Profile) -> str:
+	if profile.mountEnabled:
+		return Path(profile.mountPath).expanduser().resolve(strict=False).as_uri()
+	return f"{config.KIO_SCHEME}:/p/{profile.id}/"
+
+
+def _placeHrefs(profileId: str, mountPath: str) -> set[str]:
+	hrefs: set[str] = {f"{config.KIO_SCHEME}:/p/{profileId}"}
+	if mountPath != "":
+		mount: Path = Path(mountPath).expanduser().resolve(strict=False)
+		hrefs.add(mount.as_uri())
+	return hrefs
 
 
 def upsertProfilePlace(profile: config.Profile) -> None:
-	href: str = f"{config.KIO_SCHEME}:/p/{profile.id}/"
+	href: str = placeHref(profile)
+	known: set[str] = _placeHrefs(profile.id, profile.mountPath)
 	placeId: str = f"FastOneDrivePlace-{profile.id}"
 	path: Path = Path.home() / ".local" / "share" / "user-places.xbel"
 	if not path.is_file():
@@ -276,7 +404,7 @@ def upsertProfilePlace(profile: config.Profile) -> None:
 	ET.register_namespace("bookmark", _BOOKMARK_NS)
 	ET.register_namespace("kdepriv", "http://www.kde.org/kdepriv")
 	ET.register_namespace("mime", "http://www.freedesktop.org/standards/shared-mime-info")
-	tree: ET.ElementTree = ET.parse(path)
+	tree = ET.parse(path)
 	root: ET.Element | None = tree.getroot()
 	if root is None:
 		raise FastOneDriveError("user-places.xbel sem elemento xbel")
@@ -285,14 +413,31 @@ def upsertProfilePlace(profile: config.Profile) -> None:
 		current: str = bookmark.get("href") or ""
 		bookmarkId: str = _bookmarkId(bookmark)
 		legacyRoot: bool = profile.legacy and _isLegacyPlace(current, bookmarkId)
-		if current.rstrip("/") == href.rstrip("/") or bookmarkId == placeId or legacyRoot:
+		if current.rstrip("/") in known or bookmarkId == placeId or legacyRoot:
+			if updated:
+				# Um só Local por perfil: o marcador antigo do protocolo e o da pasta
+				# FUSE fundem-se no primeiro.
+				root.remove(bookmark)
+				continue
 			bookmark.set("href", href)
 			_setBookmarkTitle(bookmark, profile.name)
 			_setBookmarkId(bookmark, placeId)
+			_setBookmarkIcon(bookmark, "fastonedrive")
 			updated = True
 	if not updated:
 		root.append(_newBookmark(href, profile.name, placeId))
 	_writePlaces(path, root)
+
+
+def _setBookmarkIcon(bookmark: ET.Element, iconName: str) -> None:
+	info: ET.Element | None = bookmark.find("info")
+	if info is None:
+		return
+	for metadata in info.findall("metadata"):
+		found: ET.Element | None = metadata.find(_ICON_TAG)
+		if found is not None:
+			found.set("name", iconName)
+			return
 
 
 def removeProfilePlace(profileId: str) -> None:
@@ -304,7 +449,7 @@ def removeProfilePlace(profileId: str) -> None:
 	ET.register_namespace("bookmark", _BOOKMARK_NS)
 	ET.register_namespace("kdepriv", "http://www.kde.org/kdepriv")
 	ET.register_namespace("mime", "http://www.freedesktop.org/standards/shared-mime-info")
-	tree: ET.ElementTree = ET.parse(path)
+	tree = ET.parse(path)
 	root: ET.Element | None = tree.getroot()
 	if root is None:
 		return
@@ -318,113 +463,84 @@ def removeProfilePlace(profileId: str) -> None:
 		_writePlaces(path, root)
 
 
-def _hideMountInHome(mountPath: Path) -> None:
+def _unhideMountInHome(mountPath: Path) -> None:
 	mount: Path = mountPath.expanduser().resolve(strict=False)
 	home: Path = config.homeDir().resolve()
 	if mount.parent != home:
 		return
-	name: str = mount.name
 	hiddenPath: Path = home / ".hidden"
-	lines: list[str] = []
-	if hiddenPath.is_file():
-		lines = hiddenPath.read_text(encoding="utf-8").splitlines()
-	names: list[str] = [line.strip() for line in lines]
-	if name in names:
+	if not hiddenPath.is_file():
 		return
-	lines.append(name)
-	_replaceText(hiddenPath, "\n".join(lines) + "\n")
+	lines: list[str] = hiddenPath.read_text(encoding="utf-8").splitlines()
+	kept: list[str] = [line for line in lines if line.strip() != mount.name]
+	if len(kept) == len(lines):
+		return
+	if len(kept) == 0:
+		hiddenPath.unlink(missing_ok=True)
+		return
+	_replaceText(hiddenPath, "\n".join(kept) + "\n")
 
 
-def _rewriteFusePlaces(path: Path) -> None:
+def _rewriteKioItemPlaces(path: Path) -> None:
+	"""Marcadores fastonedrive:/…/item/X voltam a file://<pasta do perfil>/X.
+
+	Também tira a entrada da montagem FUSE em Dispositivos: a pasta já está nos Locais.
+	"""
 	ET.register_namespace("bookmark", _BOOKMARK_NS)
 	ET.register_namespace("kdepriv", "http://www.kde.org/kdepriv")
 	ET.register_namespace("mime", "http://www.freedesktop.org/standards/shared-mime-info")
-	tree: ET.ElementTree = ET.parse(path)
+	tree = ET.parse(path)
 	root: ET.Element | None = tree.getroot()
 	if root is None:
 		return
-	mounts: list[tuple[Path, str]] = []
+	mounts: dict[str, Path] = {}
+	legacyMount: Path | None = None
 	for profile in config.listProfiles():
-		mounts.append(
-			(
-				Path(profile.mountPath).expanduser().resolve(strict=False),
-				profile.id,
-			)
-		)
-	if len(mounts) == 0:
-		mounts.append((config.mountPath().expanduser().resolve(strict=False), ""))
-	existing: set[str] = set()
-	for bookmark in root.findall("bookmark"):
-		href: str = bookmark.get("href") or ""
-		if href.startswith(f"{config.KIO_SCHEME}:"):
-			existing.add(href)
+		if not profile.mountEnabled:
+			continue
+		mount: Path = Path(profile.mountPath).expanduser().resolve(strict=False)
+		mounts[profile.id] = mount
+		if profile.legacy:
+			legacyMount = mount
 	changed: bool = False
 	for child in list(root):
-		if child.tag == "bookmark":
-			bestMount: Path | None = None
-			bestId: str = ""
-			bestLen: int = -1
-			href: str = child.get("href") or ""
-			parsed: ParseResult = urlparse(href)
-			if parsed.scheme == "file":
-				local: Path = Path(unquote(parsed.path)).resolve(strict=False)
-				for mount, profileId in mounts:
-					try:
-						local.relative_to(mount)
-					except ValueError:
-						continue
-					length: int = len(mount.parts)
-					if length > bestLen:
-						bestLen = length
-						bestMount = mount
-						bestId = profileId
-			if bestMount is None:
-				continue
-			if _rewriteFuseBookmark(
-				child,
-				root,
-				bestMount,
-				existing,
-				bestId,
-			):
-				changed = True
-		elif child.tag == "separator":
-			for mount, _profileId in mounts:
+		if child.tag == "separator":
+			for mount in mounts.values():
 				if _isFuseDeviceSeparator(child, str(mount)):
 					root.remove(child)
 					changed = True
 					break
+			continue
+		if child.tag != "bookmark":
+			continue
+		href: str = child.get("href") or ""
+		local: Path | None = _fileForKioItem(href, mounts, legacyMount)
+		if local is None:
+			continue
+		child.set("href", local.as_uri())
+		changed = True
 	if changed:
 		_writePlaces(path, root)
 
 
-def _rewriteFuseBookmark(
-	bookmark: ET.Element,
-	root: ET.Element,
-	mount: Path,
-	existing: set[str],
-	profileId: str,
-) -> bool:
-	href: str = bookmark.get("href") or ""
-	kioHref: str | None = _kioHrefForFuseFile(href, mount, profileId)
-	if kioHref is None:
-		return False
-	if kioHref in existing:
-		root.remove(bookmark)
-		return True
-	bookmark.set("href", kioHref)
-	existing.add(kioHref)
-	icon: ET.Element | None = None
-	info: ET.Element | None = bookmark.find("info")
-	if info is not None:
-		for metadata in info.findall("metadata"):
-			found: ET.Element | None = metadata.find(_ICON_TAG)
-			if found is not None:
-				icon = found
-				break
-	if icon is not None:
-		icon.set("name", "folder-cloud")
-	return True
+def _fileForKioItem(href: str, mounts: dict[str, Path], legacyMount: Path | None) -> Path | None:
+	prefix: str = f"{config.KIO_SCHEME}:"
+	if not href.startswith(prefix):
+		return None
+	body: str = unquote(href[len(prefix):]).lstrip("/")
+	mount: Path | None = legacyMount
+	if body.startswith("p/"):
+		parts: list[str] = body.split("/", 2)
+		if len(parts) < 2:
+			return None
+		mount = mounts.get(parts[1])
+		body = parts[2] if len(parts) > 2 else ""
+	if mount is None or not body.startswith("item/"):
+		return None
+	relative: str = body[len("item/"):].strip("/")
+	if relative == "":
+		return mount
+	return mount / relative
 
 
 def _isFuseDeviceSeparator(separator: ET.Element, mountText: str) -> bool:
@@ -441,24 +557,6 @@ def _isFuseDeviceSeparator(separator: ET.Element, mountText: str) -> bool:
 	return False
 
 
-def _kioHrefForFuseFile(href: str, mount: Path, profileId: str) -> str | None:
-	parsed: ParseResult = urlparse(href)
-	if parsed.scheme != "file":
-		return None
-	local: Path = Path(unquote(parsed.path)).resolve(strict=False)
-	try:
-		relative: Path = local.relative_to(mount)
-	except ValueError:
-		return None
-	posix: str = relative.as_posix()
-	prefix: str = config.KIO_SCHEME + ":"
-	if profileId != "":
-		prefix = f"{config.KIO_SCHEME}:/p/{profileId}"
-	if posix == ".":
-		return f"{prefix}/"
-	return f"{prefix}/item/{quote(posix, safe='/')}"
-
-
 def _insertPlaceBookmark(href: str, title: str, placeId: str) -> None:
 	path: Path = Path.home() / ".local" / "share" / "user-places.xbel"
 	if not path.is_file():
@@ -471,7 +569,7 @@ def _insertPlaceBookmark(href: str, title: str, placeId: str) -> None:
 		f"  <title>{title}</title>\n"
 		"  <info>\n"
 		'   <metadata owner="http://freedesktop.org">\n'
-		'    <bookmark:icon name="folder-cloud"/>\n'
+		'    <bookmark:icon name="fastonedrive"/>\n'
 		"   </metadata>\n"
 		'   <metadata owner="http://www.kde.org">\n'
 		f"    <ID>{placeId}</ID>\n"
@@ -497,7 +595,7 @@ def _newBookmark(href: str, title: str, placeId: str) -> ET.Element:
 		"metadata",
 		{"owner": "http://freedesktop.org"},
 	)
-	ET.SubElement(freedesktop, _ICON_TAG, {"name": "folder-cloud"})
+	ET.SubElement(freedesktop, _ICON_TAG, {"name": "fastonedrive"})
 	kde: ET.Element = ET.SubElement(info, "metadata", {"owner": _KDE_OWNER})
 	idNode: ET.Element = ET.SubElement(kde, "ID")
 	idNode.text = placeId

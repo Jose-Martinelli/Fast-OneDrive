@@ -1,11 +1,15 @@
+import fcntl
 import os
 import re
 import shutil
 import sqlite3
 import subprocess
 import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TextIO
 from urllib.parse import unquote, urlparse
 
 from fastonedrive import FastOneDriveError
@@ -149,7 +153,12 @@ def removeProfile(profileId: str, discardLocal: bool = False) -> None:
 	removeProfilePlace(profile.id)
 	state: Path = config.profileStateDir(profile)
 	if state.is_dir():
-		shutil.rmtree(state)
+		with _profileJobsIdle(state):
+			if not discardLocal and _profileHasPending(profile):
+				raise FastOneDriveError(
+					"há alterações locais por enviar; a remoção do perfil foi recusada"
+				)
+			shutil.rmtree(state)
 	mount: Path = Path(profile.mountPath).expanduser()
 	try:
 		mount.rmdir()
@@ -165,18 +174,48 @@ def removeProfile(profileId: str, discardLocal: bool = False) -> None:
 		config.clearActiveProfile()
 
 
-def writeRemoteToken(remoteName: str, token: str) -> None:
+@contextmanager
+def _profileJobsIdle(state: Path) -> Iterator[None]:
+	handles: list[TextIO] = []
+	try:
+		for name in ("pins.lock", "cache.lock"):
+			handle: TextIO = (state / name).open("a+", encoding="utf-8")
+			handles.append(handle)
+			try:
+				fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+			except BlockingIOError as error:
+				raise FastOneDriveError(
+					"há uma sincronização em curso neste perfil; tente remover daqui a pouco"
+				) from error
+		yield
+	finally:
+		for handle in reversed(handles):
+			handle.close()
+
+
+def writeRemoteToken(remoteName: str, token: str, fields: dict[str, str] | None = None) -> None:
+	"""Grava o token (e campos extra como client_id/client_secret) na secção do remote."""
 	name: str = remoteName.strip()
 	if name == "" or "\n" in token or "\r" in token:
 		raise FastOneDriveError("token inválido")
+	extra: dict[str, str] = {
+		key: value.strip() for key, value in (fields or {}).items() if value.strip() != ""
+	}
+	for key, value in extra.items():
+		if "\n" in value or "\r" in value or "=" in key or key.strip() == "":
+			raise FastOneDriveError(f"campo inválido no rclone.conf: {key}")
 	path: Path = config.rcloneConfigPath()
 	path.parent.mkdir(parents=True, exist_ok=True)
 	header: str = f"[{name}]"
-	with config.rcloneConfigLock():
+	from fastonedrive.secretconf import plainConfigForEdit
+
+	with plainConfigForEdit(path), config.rcloneConfigLock():
 		lines: list[str] = []
 		if path.is_file():
 			lines = path.read_text(encoding="utf-8").splitlines()
 		updated: list[str] = _upsertTokenSection(lines, header, token)
+		if len(extra) > 0:
+			updated = _upsertSectionFields(updated, header, extra)
 		body: str = "\n".join(updated)
 		if body != "" and not body.endswith("\n"):
 			body += "\n"
@@ -230,6 +269,38 @@ def _upsertTokenSection(lines: list[str], header: str, token: str) -> list[str]:
 	return [*lines[: start + 1], *rebuilt, *lines[end:]]
 
 
+def _upsertSectionFields(lines: list[str], header: str, fields: dict[str, str]) -> list[str]:
+	start: int | None = None
+	end: int = len(lines)
+	for index, line in enumerate(lines):
+		stripped: str = line.strip()
+		if not (stripped.startswith("[") and stripped.endswith("]")):
+			continue
+		if start is None and stripped == header:
+			start = index
+			continue
+		if start is not None:
+			end = index
+			break
+	if start is None:
+		return lines
+	pending: dict[str, str] = dict(fields)
+	rebuilt: list[str] = []
+	for item in lines[start + 1 : end]:
+		key: str = item.split("=", 1)[0].strip().lower() if "=" in item else ""
+		if key in pending:
+			rebuilt.append(f"{key} = {pending.pop(key)}")
+			continue
+		rebuilt.append(item)
+	while len(rebuilt) > 0 and rebuilt[-1].strip() == "":
+		rebuilt.pop()
+	rebuilt.extend(f"{key} = {value}" for key, value in pending.items())
+	tail: list[str] = lines[end:]
+	if len(tail) > 0:
+		rebuilt.append("")
+	return [*lines[: start + 1], *rebuilt, *tail]
+
+
 def removeRemoteSection(remoteName: str) -> None:
 	path: Path = config.rcloneConfigPath()
 	if not path.is_file():
@@ -258,6 +329,13 @@ def removeRemoteSection(remoteName: str) -> None:
 
 
 def _stripRemoteSection(path: Path, remoteName: str) -> None:
+	from fastonedrive.secretconf import plainConfigForEdit
+
+	with plainConfigForEdit(path):
+		_stripRemoteSectionPlain(path, remoteName)
+
+
+def _stripRemoteSectionPlain(path: Path, remoteName: str) -> None:
 	header: str = f"[{remoteName.strip()}]"
 	lines: list[str] = path.read_text(encoding="utf-8").splitlines(keepends=True) if path.is_file() else []
 	kept: list[str] = []
@@ -345,7 +423,9 @@ def remoteSectionStatus(remoteName: str) -> dict[str, str] | None:
 	inside: bool = False
 	found: bool = False
 	status: dict[str, str] = {}
-	for line in path.read_text(encoding="utf-8").splitlines():
+	from fastonedrive.secretconf import readConfigText
+
+	for line in readConfigText(path).splitlines():
 		stripped: str = line.strip()
 		if stripped.startswith("[") and stripped.endswith("]"):
 			if inside:

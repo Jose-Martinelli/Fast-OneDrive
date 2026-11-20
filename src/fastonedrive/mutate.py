@@ -1,6 +1,8 @@
+import atexit
 import mimetypes
 import os
 import subprocess
+import threading
 from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -9,6 +11,7 @@ from shutil import copy2
 
 from fastonedrive import FastOneDriveError
 from fastonedrive import config
+from fastonedrive.log import logError
 from fastonedrive.disk import (
 	assertFreeSpace,
 	cacheJobsLock,
@@ -45,6 +48,13 @@ from fastonedrive.rclone import (
 	remoteStat,
 )
 from fastonedrive.search import cacheLocalPath, pinnedLocalPath
+
+STAGED_DEBOUNCE_SEC: float = 1.0
+STAGED_BATCH: int = 50
+_stagedLock: threading.Lock = threading.Lock()
+_stagedPending: dict[str, list[str]] = {}
+_stagedTimer: threading.Timer | None = None
+_stagedExitHooked: bool = False
 
 
 def _refuseIfExists(destRemote: str, overwrite: bool) -> None:
@@ -133,17 +143,26 @@ def stageLocalWrite(localPath: str, dest: str, overwrite: bool = False) -> str:
 	itemPath: str = remoteItemPath(destRemote)
 	_assertSafeItemPath(itemPath)
 	if isEphemeralPath(itemPath):
-		return destRemote
+		return putLocalToRemote(localPath, dest, overwrite=overwrite)
 	sourceIsDir: bool = source.is_dir() and not source.is_symlink()
 	_refuseLocal(itemPath, sourceIsDir, overwrite)
 	backing: Path = _localBacking(itemPath)
 	assertFreeSpace(backing, _treeBytes(source))
-	staged: list[str]
-	if sourceIsDir:
-		staged = _stageDirectory(source, itemPath)
-	else:
-		_stageFile(source, itemPath)
-		staged = [itemPath]
+	conflict: str = ""
+	with cacheJobsLock():
+		if overwrite:
+			conflict = _preserveDirtyDestination(itemPath)
+		try:
+			staged: list[str]
+			if sourceIsDir:
+				staged = _stageDirectory(source, itemPath)
+			else:
+				_stageFile(source, itemPath)
+				staged = [itemPath]
+		except Exception:
+			_undoPreserve(itemPath, conflict)
+			raise
+		_finishPreserved(conflict)
 	notifyDirChanged(itemPath)
 	_scheduleStaged(staged)
 	return destRemote
@@ -214,12 +233,20 @@ def _stageDirectoryNode(itemPath: str) -> None:
 
 
 def _stageFile(source: Path, itemPath: str) -> None:
+	from fastonedrive.chunks import deleteChunkRow
+
 	target: Path = _localBacking(itemPath)
 	target.parent.mkdir(parents=True, exist_ok=True)
-	_indexStagedFile(itemPath, None)
 	if not _sameFile(source, target):
-		copy2(source, target)
+		staging: Path = target.with_name(f".fod-staging-{target.name}")
+		try:
+			copy2(source, staging)
+			os.replace(staging, target)
+		except BaseException:
+			staging.unlink(missing_ok=True)
+			raise
 	_dropOtherCopy(itemPath, target)
+	deleteChunkRow(itemPath)
 	_indexStagedFile(itemPath, target)
 
 
@@ -270,32 +297,76 @@ def _mimeType(name: str) -> str:
 
 
 def _scheduleStaged(paths: list[str]) -> None:
+	global _stagedTimer, _stagedExitHooked
+	if len(paths) == 0:
+		return
+	profile: config.Profile | None = config.activeProfile()
+	profileId: str = profile.id if profile is not None else ""
+	with _stagedLock:
+		bucket: list[str] = _stagedPending.setdefault(profileId, [])
+		bucket.extend(paths)
+		if _stagedTimer is not None:
+			_stagedTimer.cancel()
+		timer: threading.Timer = threading.Timer(STAGED_DEBOUNCE_SEC, _flushStaged)
+		timer.daemon = True
+		_stagedTimer = timer
+		timer.start()
+		if not _stagedExitHooked:
+			atexit.register(_flushStaged)
+			_stagedExitHooked = True
+
+
+def _stagedRoots(paths: list[str]) -> list[str]:
+	unique: set[str] = set(paths)
+	roots: list[str] = []
+	for itemPath in sorted(unique):
+		covered: bool = False
+		parent: str = parentPath(itemPath)
+		while parent != "":
+			if parent in unique:
+				covered = True
+				break
+			parent = parentPath(parent)
+		if not covered:
+			roots.append(itemPath)
+	return roots
+
+
+def _flushStaged() -> None:
+	global _stagedTimer
 	from fastonedrive.log import logError
 
-	if len(paths) == 0:
+	with _stagedLock:
+		pending: dict[str, list[str]] = dict(_stagedPending)
+		_stagedPending.clear()
+		_stagedTimer = None
+	if len(pending) == 0:
 		return
 	try:
 		binary: str = config.cliBin()
 	except FastOneDriveError as error:
 		logError(str(error), extra={"step": "sync-detach"})
 		return
-	profile: config.Profile | None = config.activeProfile()
-	command: list[str] = [binary]
-	if profile is not None:
-		command.extend(["--profile", profile.id])
-	command.append("sync-pins")
-	command.extend(["--path", paths[0]])
-	try:
-		subprocess.Popen(
-			command,
-			stdin=subprocess.DEVNULL,
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-			start_new_session=True,
-			close_fds=True,
-		)
-	except OSError as error:
-		logError(str(error), extra={"step": "sync-detach"})
+	for profileId, staged in pending.items():
+		roots: list[str] = _stagedRoots(staged)
+		for offset in range(0, len(roots), STAGED_BATCH):
+			command: list[str] = [binary]
+			if profileId != "":
+				command.extend(["--profile", profileId])
+			command.append("sync-pins")
+			for itemPath in roots[offset : offset + STAGED_BATCH]:
+				command.extend(["--path", itemPath])
+			try:
+				subprocess.Popen(
+					command,
+					stdin=subprocess.DEVNULL,
+					stdout=subprocess.DEVNULL,
+					stderr=subprocess.DEVNULL,
+					start_new_session=True,
+					close_fds=True,
+				)
+			except OSError as error:
+				logError(str(error), extra={"step": "sync-detach"})
 
 
 def putLocalToRemote(
@@ -310,8 +381,6 @@ def putLocalToRemote(
 	destRemote: str = toRemotePath(dest)
 	itemPath: str = remoteItemPath(destRemote)
 	_assertSafeItemPath(itemPath)
-	if isEphemeralPath(itemPath):
-		return destRemote
 	with cacheJobsLock():
 		conflict: str = ""
 		if _sourceIsDestCopy(source, itemPath):
@@ -371,18 +440,31 @@ def mkdirRemotePath(dest: str) -> str:
 				True,
 			)
 	notifyDirChanged(itemPath)
+	setSyncState(itemPath, "")
 	return destRemote
 
 
-def removeRemotePath(source: str, expectFile: bool | None = None) -> str:
+def removeRemotePath(
+	source: str,
+	expectFile: bool | None = None,
+	discardLocalEdits: bool = False,
+) -> str:
+	"""Apaga na nuvem e no disco.
+
+	discardLocalEdits: o utilizador apagou o ficheiro no explorador (~/OneDrive). Como
+	no Windows, apaga mesmo com alterações por enviar ou num estado de erro; antes, o
+	Dolphin mostrava "Não foi possível excluir" para um ficheiro preso a sincronizar.
+	"""
 	remotePath: str = toRemotePath(source)
 	itemPath: str = remoteItemPath(remotePath)
 	_assertSafeItemPath(itemPath)
 	with cacheJobsLock():
-		if _pendingLocalEdit(itemPath):
+		if not discardLocalEdits and _pendingLocalEdit(itemPath):
 			raise FastOneDriveError("há alterações locais por enviar")
 		stat = remoteStat(remotePath)
 		if stat is None:
+			if discardLocalEdits:
+				_removeLocalCopies(itemPath)
 			if _localCopyPresent(itemPath):
 				raise FastOneDriveError("não encontrado na nuvem; a cópia local foi mantida")
 			deleteIndexTree(itemPath)
@@ -568,7 +650,6 @@ def _preserveDirtyDestination(itemPath: str) -> str:
 		return ""
 	from datetime import datetime
 
-	from fastonedrive.index import parentPath
 	from fastonedrive.search import relocateStoredFiles
 
 	parent: str = parentPath(itemPath)
@@ -904,3 +985,90 @@ def _moveLocalCopies(oldPath: str, newPath: str) -> None:
 		if pathPresent(dest):
 			removePath(dest, ignoreErrors=True)
 		source.rename(dest)
+
+
+def moveRemoteFast(oldPath: str, newPath: str) -> bool:
+	"""Renomear/mover dentro do mesmo drive pelo Graph (~0,3 s) em vez do rclone moveto
+	(vários segundos com o cache.lock seguro). Devolve False quando o caminho completo
+	(moveRemotePath) tem de decidir: destino ocupado ou por enviar, outro drive, item ou
+	pasta de destino ainda sem id, Graph recusou."""
+	from fastonedrive import graphitems
+
+	if oldPath == "" or newPath == "" or newPath.startswith(f"{oldPath}/"):
+		return False
+	entry = getEntry(oldPath)
+	if entry is None or str(entry["itemId"] or "") == "":
+		return False
+	if getEntry(newPath) is not None or _localCopyPresent(newPath):
+		return False
+	try:
+		if graphitems.driveOf(oldPath) != graphitems.driveOf(parentPath(newPath)):
+			return False
+		graphitems.moveItem(oldPath, newPath)
+	except graphitems.GraphUnreachable:
+		raise
+	except FastOneDriveError as error:
+		logError(f"move Graph recusado, a usar rclone: {error}", extra={"path": oldPath})
+		return False
+	with cacheJobsLock():
+		renameIndexPath(oldPath, newPath)
+		_moveLocalCopies(oldPath, newPath)
+	notifyDirChanged(newPath)
+	notifyDirChanged(oldPath)
+	return True
+
+
+def rmdirRemoteFast(itemPath: str) -> bool:
+	"""Apagar pasta vazia pelo Graph. Uma pasta com filhos na nuvem (ainda fora do
+	índice) não é apagada: o DELETE do Graph apagaria tudo."""
+	from fastonedrive import graphitems
+
+	entry = getEntry(itemPath)
+	if entry is None or not bool(entry["isDir"]) or str(entry["itemId"] or "") == "":
+		return False
+	try:
+		if graphitems.folderHasChildren(itemPath):
+			raise FolderNotEmpty("a pasta não está vazia na nuvem")
+		graphitems.deleteItem(itemPath)
+	except graphitems.GraphItemGone:
+		return True
+	except (graphitems.GraphUnreachable, FolderNotEmpty):
+		raise
+	except FastOneDriveError as error:
+		logError(f"rmdir Graph recusado, a usar rclone: {error}", extra={"path": itemPath})
+		return False
+	return True
+
+
+class FolderNotEmpty(FastOneDriveError):
+	pass
+
+
+def mkdirRemoteFast(itemPath: str) -> None:
+	"""mkdir pelo Graph (cria as pastas de cima em falta). Sem rede: GraphUnreachable.
+	O Graph recusou por outro motivo: rclone mkdir, como antes."""
+	from fastonedrive import graphitems
+
+	try:
+		stat: dict[str, Any] = graphitems.createFolder(itemPath)
+	except graphitems.GraphUnreachable:
+		raise
+	except FastOneDriveError as error:
+		logError(f"mkdir Graph recusado, a usar rclone: {error}", extra={"path": itemPath})
+		mkdirRemotePath(config.remotePath(itemPath))
+		return
+	upsertEntry(
+		itemPath,
+		itemPath.rsplit("/", 1)[-1],
+		True,
+		0,
+		storedPinFlag(itemPath),
+		str(stat.get("ModTime") or ""),
+		"",
+		"",
+		str(stat.get("ID") or ""),
+	)
+	if shouldStorePinned(itemPath):
+		pinnedLocalPath(itemPath).mkdir(parents=True, exist_ok=True)
+	setSyncState(itemPath, "")
+	notifyDirChanged(itemPath)

@@ -1,58 +1,56 @@
-# Ambiente do autor
+# Ambiente e paths
 
-Atualizar este ficheiro se o mount/portas mudarem.
+## Dependências típicas
 
-## SO
-
-- CachyOS (Arch), kernel recente, Plasma
-- User: `josefm` (uid 1000), shell fish
-- Um utilizador humano
-
-## Discos (aprox.)
-
-| Mount | Uso | Notas |
-|---|---|---|
-| `/home` (NVMe ~928 GiB) | ~512 GiB livres | `~/OneDrive`, `~/Downloads`, cache VFS |
-| `/mnt/jogos` | ~114 GiB livres | destino preferido de ROMs se couber |
-| `/mnt/programacao` | ~381 GiB livres | **este repo** e código |
-| `/mnt/removivel` | USB | irrelevante para o MVP |
+- SO: Linux com KDE Plasma (testado em Arch/CachyOS)
+- `rclone` ≥ 1.68 em `/usr/bin/rclone`
+- Python ≥ 3.11, PyQt6, dbus, gobject; `fuse2` + `fuse3`; SQLite ≥ 3.45
 
 ## rclone
 
-- Binário: `/usr/bin/rclone` (1.76.0)
-- Config do **mount**: `/home/josefm/.config/rclone/rclone.conf`
-- Remote: `onedrive:` (`type=onedrive`, `drive_type=personal`)
-- Mount: `/home/josefm/OneDrive` — FUSE **próprio** do Fast-OneDrive (`fastonedrive fuse`)
-- Unidade antiga: `rclone-onedrive.service` (**desligada**, RC 5572)
-- Unidade Fast-OneDrive: `~/.config/systemd/user/fast-onedrive-mount.service` (sem RC 5573)
+- Config do sistema (opcional, ex. RClone Manager): `~/.config/rclone/rclone.conf`
+- Config do Fast-OneDrive: `~/.config/fast-onedrive/rclone.conf` (um remote por perfil)
+- Perfil migrado: remote `onedrive:` → pasta `~/OneDrive`
+- Mount: FUSE próprio (`fastonedrive fuse` / `fast-onedrive-mount@<perfil>.service`, `Type=notify`, sem RC)
+- Unidade antiga `rclone-onedrive.service` (RC 5572): desligada; o Fast-OneDrive não a usa
 - Jobs: subprocesso rclone com `--config ~/.config/fast-onedrive/rclone.conf`
-- Sem `client_id` Azure próprio (app partilhada do rclone; risco de 429)
 
-## Paths OneDrive úteis
-
-```text
-onedrive:Documentos/                    # ~700 GiB backups — não pin/sync
-onedrive:TRABALHO/                      # partilhada, na raiz
-onedrive:Área de Trabalho/
-onedrive:Documentos/A Meus Documentos/Programas/Emuladores/roms/Switch/
-```
-
-## Fast-OneDrive
+## Paths Fast-OneDrive
 
 ```text
 DB:      ~/.local/share/fast-onedrive/profiles/<id>/index.db
 Pin:     ~/.local/share/fast-onedrive/profiles/<id>/pinned/
 Cache:   ~/.local/share/fast-onedrive/profiles/<id>/cache/
 Config:  ~/.config/fast-onedrive/config.toml   ([[profiles]])
-rclone:  ~/.config/fast-onedrive/rclone.conf  (um remote por perfil)
+rclone:  ~/.config/fast-onedrive/rclone.conf
 UI:      fastonedrive settings
-FUSE:    fast-onedrive-mount@<id>.service → pasta do perfil (sem RC)
+Sync:    ~/.config/fast-onedrive/sync-control.json
+Plugins: ~/.local/lib/qt6/plugins/kf6/{overlayicon,kfileitemaction}/
+FUSE:    fast-onedrive-mount@<id>.service → pasta do perfil
 Legado:  perfil onedrive em ~/OneDrive
-Pacote:  packaging/arch/PKGBUILD  (fast-onedrive; ainda não AUR)
+Pacote:  packaging/arch/PKGBUILD  (ainda não AUR)
 ```
 
 ## Apps à volta (não são dependências)
 
-- RClone Manager — cópia GUI já a funcionar; Fast-OneDrive deve conviver
-- FSearch — o autor chegou a apontar a `~/OneDrive`; este projeto **não** exige FSearch
-- Baloo — indexa `$HOME/` incluindo o FUSE; **excluir** `~/OneDrive` no Plasma (não é código deste repo, mas o CONTEXT manda não martelar o mount)
+- RClone Manager — pode coexistir; Fast-OneDrive usa a sua própria cópia do `rclone.conf`
+- Baloo — o `install-kio` acrescenta a pasta de cada perfil a `excludeFolders`
+- FSearch / KFind — fora de âmbito; a busca é o índice SQLite (KRunner / `fastonedrive:/search/…`)
+
+## Variáveis de ambiente (opcionais)
+
+O CLI **não** carrega `.env` automaticamente. Ver [`.env.example`](../.env.example) na raiz.
+
+| Variável | Efeito |
+|---|---|
+| `FASTONEDRIVE_BIN` | Caminho do CLI para KIO/plugins (omissão: `~/.local/bin/fastonedrive`) |
+| `FASTONEDRIVE_NO_PUSH=1` | Desliga avisos Graph em tempo real; só poll |
+| `FASTONEDRIVE_QUIET=1` | Suprime `logInfo` (erros mantêm-se) |
+| `FASTONEDRIVE_UI_TAB=rclone` | Abre Definições no separador rclone |
+| `FUSE_LIBRARY_PATH` | Caminho alternativo da libfuse |
+| `NOTIFY_SOCKET` | Socket systemd `Type=notify` (unidade do mount) |
+| `QT_PLUGIN_PATH` | Pesquisa de plugins Qt/KF |
+
+Internas (o processo define-as; não configurar à mão): `FASTONEDRIVE_INDEXING`, `FASTONEDRIVE_DELTA_ONLY`, `RCLONE_PASSWORD_COMMAND`, `RCLONE_ASK_PASSWORD`.
+
+Segredos (tokens OAuth, `client_secret`, senha do `rclone.conf`) vivem em `~/.config/fast-onedrive/rclone.conf` e/ou na carteira do sistema — **nunca** em variáveis de ambiente de sessão nem no repositório.

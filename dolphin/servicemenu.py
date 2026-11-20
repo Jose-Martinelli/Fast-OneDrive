@@ -1,4 +1,4 @@
-#!/usr/bin/python3.14
+#!/usr/bin/env python3
 import os
 import subprocess
 import sys
@@ -7,7 +7,11 @@ from pathlib import Path
 
 
 def cliWrapperPath() -> Path:
-	return Path.home() / ".local" / "bin" / "fastonedrive"
+	local: Path = Path.home() / ".local" / "bin" / "fastonedrive"
+	system: Path = Path("/usr/bin/fastonedrive")
+	if not local.is_file() and system.is_file():
+		return system
+	return local
 
 
 def logPath() -> Path:

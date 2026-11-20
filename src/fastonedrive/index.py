@@ -1,16 +1,12 @@
-import fcntl
 import json
 import os
 import sqlite3
 import subprocess
 import sys
 import threading
-import time
-from collections.abc import Iterator
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, TextIO
+from typing import Any
 
 from fastonedrive import FastOneDriveError
 from fastonedrive import config
@@ -74,7 +70,10 @@ ON CONFLICT(path) DO UPDATE SET
 	itemId = CASE WHEN excluded.itemId = '' THEN files.itemId ELSE excluded.itemId END,
 	updatedAt = excluded.updatedAt,
 	syncState = CASE
-		WHEN files.syncState IN ('dirty', 'syncing')
+		-- Só "dirty": em "syncing" o envio é nosso e a versão nova que o delta traz pode
+		-- ser a que acabámos de enviar (o envio fixa a base no fim). Os tokens chegam
+		-- já na forma canónica (canonicalToken), por isso a comparação é texto.
+		WHEN files.syncState = 'dirty'
 			AND excluded.etag != ''
 			AND files.baseEtag != ''
 			AND (
@@ -129,7 +128,8 @@ PROTECTED_SYNC: frozenset[str] = frozenset(
 )
 
 INDEXING_ENV: str = "FASTONEDRIVE_INDEXING"
-SCHEMA_VERSION: int = 10
+DELTA_ONLY_ENV: str = "FASTONEDRIVE_DELTA_ONLY"
+SCHEMA_VERSION: int = 15
 
 FILE_CHUNKS_SQL: str = """
 CREATE TABLE IF NOT EXISTS file_chunks (
@@ -147,24 +147,36 @@ CREATE TABLE IF NOT EXISTS chunk_writes (
 	length INTEGER NOT NULL
 )
 """
-_listingStamp: dict[str, float] = {}
-_listingBusy: set[str] = set()
-_listingLock: threading.Lock = threading.Lock()
+
+
+_schemaReady: set[str] = set()
+_schemaLock: threading.Lock = threading.Lock()
 
 
 def connectDb() -> sqlite3.Connection:
-	config.ensureDataDir()
+	dbFile: Path = config.dbPath()
+	key: str = str(dbFile)
+	ready: bool = key in _schemaReady and dbFile.is_file()
+	if not ready:
+		config.ensureDataDir()
 	connection: sqlite3.Connection = sqlite3.connect(
-		config.dbPath(),
+		dbFile,
 		timeout=15.0,
 	)
 	connection.row_factory = sqlite3.Row
-	connection.execute("PRAGMA journal_mode = WAL")
 	connection.execute("PRAGMA busy_timeout = 8000")
 	connection.execute("PRAGMA synchronous = NORMAL")
 	connection.execute("PRAGMA foreign_keys = ON")
-	_ensureFilesTable(connection)
-	_migrateSchemaIfNeeded(connection)
+	if ready:
+		return connection
+	# journal_mode e o schema persistem no ficheiro: só a primeira ligação de cada
+	# processo os verifica. O FUSE abre uma ligação por getattr; isto tira-lhe as
+	# consultas a sqlite_master e user_version.
+	with _schemaLock:
+		connection.execute("PRAGMA journal_mode = WAL")
+		_ensureFilesTable(connection)
+		_migrateSchemaIfNeeded(connection)
+		_schemaReady.add(key)
 	return connection
 
 
@@ -183,6 +195,10 @@ def rebuildIndex(remotePath: str | None = None) -> int:
 		)
 		connection: sqlite3.Connection = connectDb()
 		try:
+			from fastonedrive.searchindex import populateSearchIndexIfNeeded
+
+			if populateSearchIndexIfNeeded(connection):
+				logInfo("índice de busca sem acentos preenchido")
 			try:
 				logInfo("indexação incremental iniciada", extra={"root": root})
 				count: int = _rebuild(connection, root, startedAt)
@@ -346,469 +362,20 @@ def indexHasRows() -> bool:
 		connection.close()
 
 
-def _listingTtlPath() -> Path:
-	return config.dataDir() / "listing-ttl.json"
-
-
-def _listingDonePath() -> Path:
-	return config.dataDir() / "listing-done.json"
-
-
-def _readListingStamps(stampPath: Path) -> dict[str, float]:
-	if not stampPath.is_file():
-		return {}
-	try:
-		raw: Any = json.loads(stampPath.read_text(encoding="utf-8"))
-	except (OSError, ValueError, TypeError):
-		return {}
-	if not isinstance(raw, dict):
-		return {}
-	stamps: dict[str, float] = {}
-	for key, value in raw.items():
-		try:
-			stamps[str(key)] = float(value)
-		except (TypeError, ValueError):
-			continue
-	return stamps
-
-
-@contextmanager
-def _listingTtlLock() -> Iterator[None]:
-	config.ensureDataDir()
-	lockPath: Path = config.dataDir() / "listing-ttl.lock"
-	handle: TextIO = lockPath.open("a+", encoding="utf-8")
-	try:
-		fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-		yield
-	finally:
-		fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-		handle.close()
-
-
-def _claimListingRefresh(parentPath: str) -> bool:
-	now: float = time.time()
-	with _listingTtlLock():
-		stampPath: Path = _listingTtlPath()
-		stamps: dict[str, float] = _readListingStamps(stampPath)
-		stamp: float = stamps.get(parentPath, 0.0)
-		if now - stamp < config.READDIR_TTL_SEC:
-			return False
-		cutoff: float = now - 3600.0
-		kept: dict[str, float] = {
-			key: value for key, value in stamps.items() if value >= cutoff
-		}
-		kept[parentPath] = now
-		tmpPath: Path = stampPath.with_suffix(".json.tmp")
-		tmpPath.write_text(json.dumps(kept), encoding="utf-8")
-		tmpPath.replace(stampPath)
-		return True
-
-
-def listingCompleted(parentPath: str) -> bool:
-	with _listingTtlLock():
-		return parentPath in _readListingStamps(_listingDonePath())
-
-
-def markListingCompleted(parentPath: str) -> None:
-	with _listingTtlLock():
-		stampPath: Path = _listingDonePath()
-		done: dict[str, float] = _readListingStamps(stampPath)
-		done[parentPath] = time.time()
-		tmpPath: Path = stampPath.with_suffix(".json.tmp")
-		tmpPath.write_text(json.dumps(done), encoding="utf-8")
-		tmpPath.replace(stampPath)
-
-
-def ensureFolderListed(parentPath: str) -> None:
-	if listingCompleted(parentPath):
-		return
-	with _profileListingLock():
-		if listingCompleted(parentPath):
-			return
-		refreshParentListing(parentPath)
-		markListingCompleted(parentPath)
-
-
-def _clearListingStamp(parentPath: str) -> None:
-	with _listingTtlLock():
-		stampPath: Path = _listingTtlPath()
-		stamps: dict[str, float] = _readListingStamps(stampPath)
-		if parentPath not in stamps:
-			return
-		stamps.pop(parentPath, None)
-		tmpPath: Path = stampPath.with_suffix(".json.tmp")
-		tmpPath.write_text(json.dumps(stamps), encoding="utf-8")
-		tmpPath.replace(stampPath)
-
-
-def _listingJobLockPath() -> Path:
-	return config.dataDir() / "listing.lock"
-
-
-LISTING_QUEUE_MAX: int = 64
-
-
-def _listingQueuePath() -> Path:
-	return config.dataDir() / "listing-queue.json"
-
-
-@contextmanager
-def _listingQueueLock() -> Iterator[None]:
-	config.ensureDataDir()
-	lockPath: Path = config.dataDir() / "listing-queue.lock"
-	handle: TextIO = lockPath.open("a+", encoding="utf-8")
-	try:
-		fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-		yield
-	finally:
-		fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-		handle.close()
-
-
-@contextmanager
-def _profileListingLock() -> Iterator[None]:
-	config.ensureDataDir()
-	handle: TextIO = _listingJobLockPath().open("a+", encoding="utf-8")
-	try:
-		fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-		yield
-	finally:
-		fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-		handle.close()
-
-
-def _emptyListingJob() -> dict[str, Any]:
-	return {"pid": 0, "born": "", "paths": []}
-
-
-def _readListingJob() -> dict[str, Any]:
-	path: Path = _listingQueuePath()
-	if not path.is_file():
-		return _emptyListingJob()
-	try:
-		raw: Any = json.loads(path.read_text(encoding="utf-8"))
-	except (OSError, ValueError, TypeError):
-		return _emptyListingJob()
-	if not isinstance(raw, dict):
-		return _emptyListingJob()
-	pid: int = 0
-	try:
-		pid = int(raw.get("pid") or 0)
-	except (TypeError, ValueError):
-		pid = 0
-	born: str = str(raw.get("born") or "")
-	paths: list[str] = []
-	found: Any = raw.get("paths")
-	if isinstance(found, list):
-		item: Any
-		for item in found:
-			text: str = str(item)
-			if text not in paths:
-				paths.append(text)
-	return {"pid": pid, "born": born, "paths": paths}
-
-
-def _writeListingJob(job: dict[str, Any]) -> None:
-	path: Path = _listingQueuePath()
-	tmpPath: Path = path.with_suffix(".json.tmp")
-	tmpPath.write_text(json.dumps(job), encoding="utf-8")
-	tmpPath.replace(path)
-
-
-def _processStart(pid: int) -> str:
-	if pid <= 0:
-		return ""
-	try:
-		stat: str = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-	except OSError:
-		return ""
-	mark: int = stat.rfind(")")
-	if mark < 0:
-		return ""
-	fields: list[str] = stat[mark + 2 :].split()
-	if len(fields) < 20:
-		return ""
-	return fields[19]
-
-
-def _processAlive(pid: int) -> bool:
-	if pid <= 0:
-		return False
-	try:
-		os.kill(pid, 0)
-	except OSError:
-		return False
-	try:
-		stat: str = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-	except OSError:
-		return False
-	mark: int = stat.rfind(")")
-	if mark < 0 or mark + 2 >= len(stat):
-		return True
-	if stat[mark + 2] != "Z":
-		return True
-	try:
-		os.waitpid(pid, os.WNOHANG)
-	except OSError:
-		pass
-	return False
-
-
-def _listingOwnerAlive(pid: int, born: str) -> bool:
-	watched: int = -pid if pid < 0 else pid
-	if not _processAlive(watched):
-		return False
-	current: str = _processStart(watched)
-	if current == "" or born == "":
-		return True
-	return current == born
-
-
-def _enqueueListingPath(parentPath: str, claimWorker: bool) -> bool:
-	with _listingQueueLock():
-		job: dict[str, Any] = _readListingJob()
-		paths: list[str] = [
-			item for item in list(job["paths"]) if item != parentPath
-		]
-		paths.insert(0, parentPath)
-		if len(paths) > LISTING_QUEUE_MAX:
-			del paths[LISTING_QUEUE_MAX:]
-		job["paths"] = paths
-		spawn: bool = False
-		if claimWorker and not _listingOwnerAlive(int(job["pid"]), str(job["born"])):
-			job["pid"] = -os.getpid()
-			job["born"] = _processStart(os.getpid())
-			spawn = True
-		_writeListingJob(job)
-		return spawn
-
-
-def _dropListingClaim(parentPath: str, placeholder: int) -> None:
-	with _listingQueueLock():
-		job: dict[str, Any] = _readListingJob()
-		if int(job["pid"]) == placeholder:
-			job["pid"] = 0
-			job["born"] = ""
-		job["paths"] = [
-			item for item in list(job["paths"]) if item != parentPath
-		]
-		_writeListingJob(job)
-
-
-def _publishListingWorker(childPid: int, placeholder: int) -> None:
-	with _listingQueueLock():
-		job: dict[str, Any] = _readListingJob()
-		if int(job["pid"]) == placeholder:
-			job["pid"] = childPid
-			job["born"] = _processStart(childPid)
-			_writeListingJob(job)
-
-
-def _claimListingWorker(parentPath: str) -> bool:
-	myPid: int = os.getpid()
-	with _listingQueueLock():
-		job: dict[str, Any] = _readListingJob()
-		paths: list[str] = list(job["paths"])
-		if parentPath not in paths:
-			paths.append(parentPath)
-		job["paths"] = paths
-		owner: int = int(job["pid"])
-		if (
-			owner == myPid
-			or owner == -os.getppid()
-			or not _listingOwnerAlive(owner, str(job["born"]))
-		):
-			job["pid"] = myPid
-			job["born"] = _processStart(myPid)
-			_writeListingJob(job)
-			return True
-		_writeListingJob(job)
-		return False
-
-
-def _popListingPath() -> str | None:
-	with _listingQueueLock():
-		job: dict[str, Any] = _readListingJob()
-		if int(job["pid"]) != os.getpid():
-			return None
-		paths: list[str] = list(job["paths"])
-		if len(paths) == 0:
-			job["pid"] = 0
-			job["born"] = ""
-			_writeListingJob(job)
-			return None
-		parentPath: str = str(paths.pop(0))
-		job["paths"] = paths
-		_writeListingJob(job)
-		return parentPath
-
-
-def _releaseListingWorkerIfIdle() -> None:
-	with _listingQueueLock():
-		job: dict[str, Any] = _readListingJob()
-		if int(job["pid"]) != os.getpid():
-			return
-		if len(list(job["paths"])) > 0:
-			return
-		job["pid"] = 0
-		job["born"] = ""
-		_writeListingJob(job)
-
-
-def scheduleParentRefresh(parentPath: str) -> None:
-	with _listingLock:
-		if parentPath in _listingBusy:
-			return
-	if not _claimListingRefresh(parentPath):
-		return
-	placeholder: int = -os.getpid()
-	try:
-		spawn: bool = _enqueueListingPath(parentPath, True)
-	except Exception:
-		_clearListingStamp(parentPath)
-		raise
-	if not spawn:
-		return
-	childPid: int | None = _spawnListingRefresh(parentPath)
-	if childPid is None:
-		_dropListingClaim(parentPath, placeholder)
-		_clearListingStamp(parentPath)
-		return
-	_publishListingWorker(childPid, placeholder)
-
-
-def runParentRefresh(parentPath: str) -> None:
-	if not _claimListingWorker(parentPath):
-		return
-	try:
-		_drainListingQueue()
-	finally:
-		_releaseListingWorkerIfIdle()
-
-
-def _drainListingQueue() -> None:
-	while True:
-		parentPath: str | None = _popListingPath()
-		if parentPath is None:
-			return
-		_refreshQueuedPath(parentPath)
-
-
-def _refreshParentCommand(parentPath: str) -> list[str] | None:
-	binary: str | None = None
-	argv0: str = os.path.abspath(sys.argv[0]) if sys.argv else ""
-	if argv0 != "" and Path(argv0).is_file() and Path(argv0).name == "fastonedrive":
-		binary = argv0
-	else:
-		try:
-			binary = config.cliBin()
-		except FastOneDriveError:
-			return None
-	command: list[str] = [binary]
-	profile: config.Profile | None = config.activeProfile()
-	if profile is not None:
-		command.extend(["--profile", profile.id])
-	command.extend(["refresh-parent", "--", parentPath])
-	return command
-
-
-def _spawnListingRefresh(parentPath: str) -> int | None:
-	command: list[str] | None = _refreshParentCommand(parentPath)
-	if command is None:
-		logError("CLI fastonedrive não encontrado para actualizar a pasta")
-		return None
-	try:
-		process: subprocess.Popen[bytes] = subprocess.Popen(
-			command,
-			stdin=subprocess.DEVNULL,
-			stdout=subprocess.DEVNULL,
-			stderr=subprocess.DEVNULL,
-			start_new_session=True,
-			close_fds=True,
-		)
-	except OSError as error:
-		logError(f"falha ao actualizar a pasta em segundo plano: {error}")
-		return None
-	return int(process.pid)
-
-
-def invalidateListing(parentPath: str) -> None:
-	with _listingLock:
-		_listingStamp.pop(parentPath, None)
-	_clearListingStamp(parentPath)
-
-
-def _refreshQueuedPath(parentPath: str) -> None:
-	listed: bool = False
-	try:
-		with _listingLock:
-			_listingBusy.add(parentPath)
-		before: set[tuple[str, int, int, str, int, str]] = _childSignature(parentPath)
-		with _profileListingLock():
-			refreshParentListing(parentPath)
-		listed = True
-		after: set[tuple[str, int, int, str, int, str]] = _childSignature(parentPath)
-		markListingCompleted(parentPath)
-		if before != after:
-			from fastonedrive.notify import notifyDirChanged
-
-			notifyDirChanged(parentPath)
-	except Exception as error:
-		logError(
-			f"listagem remota em segundo plano falhou: {error}",
-			extra={"parent": parentPath},
-		)
-	finally:
-		with _listingLock:
-			_listingBusy.discard(parentPath)
-			if not listed:
-				_listingStamp.pop(parentPath, None)
-		if not listed:
-			_clearListingStamp(parentPath)
-
-
-def _childSignature(parentPath: str) -> set[tuple[str, int, int, str, int, str]]:
-	connection: sqlite3.Connection = connectDb()
-	try:
-		rows: list[sqlite3.Row] = list(
-			connection.execute(
-				"""
-				SELECT name, isDir, size, modTime, pinned, syncState
-				FROM files
-				WHERE parent = ?
-				""",
-				(parentPath,),
-			)
-		)
-		return {
-			(
-				str(row["name"]),
-				int(row["isDir"]),
-				int(row["size"]),
-				str(row["modTime"] or ""),
-				int(row["pinned"]),
-				str(row["syncState"] or ""),
-			)
-			for row in rows
-		}
-	finally:
-		connection.close()
-
-
 def upsertLiveChildren(parentPath: str, items: list[dict[str, Any]]) -> int:
 	updatedAt: str = datetime.now(timezone.utc).isoformat(timespec="seconds")
 	batch: list[tuple[Any, ...]] = []
 	seen: set[str] = set()
 	for item in items:
-		row: tuple[Any, ...] | None = _rowFromLsjson(
+		parsedRow: tuple[Any, ...] | None = _rowFromLsjson(
 			item,
 			parentPath,
 			updatedAt,
 		)
-		if row is None:
+		if parsedRow is None:
 			continue
-		batch.append(row)
-		seen.add(str(row[0]))
+		batch.append(parsedRow)
+		seen.add(str(parsedRow[0]))
 	incomingById: dict[str, str] = {}
 	for rowTuple in batch:
 		itemId: str = str(rowTuple[8] or "")
@@ -941,7 +508,7 @@ def listDescendants(itemPath: str) -> list[sqlite3.Row]:
 
 def storedUnixMode(row: sqlite3.Row) -> int | None:
 	try:
-		value: object = row["unixMode"]
+		value: Any = row["unixMode"]
 	except (IndexError, KeyError):
 		return None
 	if value is None:
@@ -1028,6 +595,25 @@ def _moveRowPayload(
 	)
 
 
+def setItemIdIfMissing(itemPath: str, itemId: str) -> None:
+	"""Depois de um envio: com o id, renomear/apagar vão logo pelo Graph em vez de
+	esperarem pelo delta (até 1 min) ou caírem no rclone."""
+	if itemPath == "" or itemId == "":
+		return
+	connection: sqlite3.Connection = connectDb()
+	try:
+		connection.execute(
+			"UPDATE files SET itemId = ? WHERE path = ? AND itemId = ''",
+			(itemId, itemPath),
+		)
+		connection.commit()
+	except sqlite3.IntegrityError:
+		# Outra linha ainda tem este id (item movido na nuvem): o delta resolve.
+		connection.rollback()
+	finally:
+		connection.close()
+
+
 def markDirty(itemPath: str) -> None:
 	if itemPath == "":
 		return
@@ -1039,7 +625,20 @@ def setSyncState(itemPath: str, state: str, error: str = "") -> None:
 		return
 	updatedAt: str = datetime.now(timezone.utc).isoformat(timespec="seconds")
 	connection: sqlite3.Connection = connectDb()
+	previous: str = ""
+	previousError: str = ""
 	try:
+		before: sqlite3.Row | None = connection.execute(
+			"SELECT syncState, syncError FROM files WHERE path = ?",
+			(itemPath,),
+		).fetchone()
+		if before is None:
+			return
+		previous = str(before[0] or "")
+		previousError = str(before[1] or "")
+		if previous == state and previousError == error and state not in (SYNC_ERROR, SYNC_CONFLICT):
+			# markDirty repetido (cada gravação, cada sync adiado): sem commit nem busctl.
+			return
 		connection.execute(
 			"""
 			UPDATE files
@@ -1051,10 +650,21 @@ def setSyncState(itemPath: str, state: str, error: str = "") -> None:
 		connection.commit()
 	finally:
 		connection.close()
+	if state == previous and state in (SYNC_ERROR, SYNC_CONFLICT):
+		# O sync de cada minuto volta a marcar o mesmo conflito: não repetir avisos.
+		return
 	if state in (SYNC_ERROR, SYNC_CONFLICT):
 		from fastonedrive.notify import notifyDirChanged
 
 		notifyDirChanged(itemPath)
+		if state == SYNC_CONFLICT:
+			from fastonedrive.notify import notifyConflict
+
+			notifyConflict(itemPath)
+	else:
+		from fastonedrive.notify import notifyStateChanged
+
+		notifyStateChanged(itemPath)
 
 
 def setBaseline(
@@ -1121,6 +731,10 @@ def setBaseline(
 		connection.commit()
 	finally:
 		connection.close()
+	if not keepSyncState:
+		from fastonedrive.notify import notifyStateChanged
+
+		notifyStateChanged(itemPath)
 
 
 def clearItemBaseline(itemPath: str) -> None:
@@ -1389,7 +1003,6 @@ def renameIndexPath(oldPath: str, newPath: str) -> None:
 			newItem = newPath
 		else:
 			newItem = f"{newPath}{path[len(oldPath):]}"
-		parent: str = parentPath(newItem)
 		payload.append(
 			_moveRowPayload(
 				row,
@@ -1578,6 +1191,11 @@ def _migrateSchemaIfNeeded(connection: sqlite3.Connection) -> None:
 	if version >= SCHEMA_VERSION:
 		return
 	_migrateSchema(connection)
+	from fastonedrive.searchindex import ensureChangeTracking, ensureSearchIndex, ensureStateIndex
+
+	ensureSearchIndex(connection)
+	ensureStateIndex(connection)
+	ensureChangeTracking(connection)
 	connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 	connection.commit()
 
@@ -1618,6 +1236,7 @@ def _migrateSchema(connection: sqlite3.Connection) -> None:
 		"""
 	)
 	_migrateBaselineTokens(connection)
+	_canonicalizeTokens(connection)
 	_clearDuplicateItemIds(connection)
 	connection.execute(
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_files_itemId ON files(itemId) WHERE itemId != ''"
@@ -1626,6 +1245,37 @@ def _migrateSchema(connection: sqlite3.Connection) -> None:
 	connection.executescript(FILE_CHUNKS_SQL)
 	connection.executescript(CHUNK_WRITES_SQL)
 	connection.commit()
+
+
+def _canonicalizeTokens(connection: sqlite3.Connection) -> None:
+	"""Schema 15: QuickXor em base64 em todo o lado (antes hex vindo do rclone/graphStat
+	e base64 vindo do delta). Linhas em "conflict" cuja nuvem é a própria base eram
+	falsos conflitos dessa mistura: voltam a "dirty" e sobem sem cópia de conflito."""
+	from fastonedrive.rclone import canonicalToken
+
+	rows: list[sqlite3.Row] = list(
+		connection.execute(
+			"SELECT path, etag, baseEtag, syncState FROM files "
+			"WHERE etag LIKE 'qxh:%' OR baseEtag LIKE 'qxh:%' OR etag LIKE 'sha1:%' OR baseEtag LIKE 'sha1:%'"
+		)
+	)
+	updates: list[tuple[str, str, str, str]] = []
+	row: sqlite3.Row
+	for row in rows:
+		etag: str = str(row["etag"] or "")
+		base: str = str(row["baseEtag"] or "")
+		newEtag: str = canonicalToken(etag)
+		newBase: str = canonicalToken(base)
+		state: str = str(row["syncState"] or "")
+		if state == SYNC_CONFLICT and newBase != "" and newBase == newEtag:
+			state = SYNC_DIRTY
+		if newEtag != etag or newBase != base or state != str(row["syncState"] or ""):
+			updates.append((newEtag, newBase, state, str(row["path"])))
+	if len(updates) > 0:
+		connection.executemany(
+			"UPDATE files SET etag = ?, baseEtag = ?, syncState = ? WHERE path = ?",
+			updates,
+		)
 
 
 def _migrateBaselineTokens(connection: sqlite3.Connection) -> None:
@@ -1745,6 +1395,10 @@ def _rebuild(connection: sqlite3.Connection, root: str, startedAt: str) -> int:
 		try:
 			return _rebuildGraph(connection, root, startedAt)
 		except GraphDeltaError as error:
+			if os.environ.get(DELTA_ONLY_ENV, "") == "1":
+				raise FastOneDriveError(
+					f"Graph indisponível; poll adiado: {error}"
+				) from error
 			logError(f"Graph indisponível, a usar rclone: {error}")
 			return _rebuildRclone(
 				connection,
@@ -1754,6 +1408,10 @@ def _rebuild(connection: sqlite3.Connection, root: str, startedAt: str) -> int:
 				True,
 			)
 	except GraphDeltaError as error:
+		if os.environ.get(DELTA_ONLY_ENV, "") == "1":
+			# O poll de cada minuto não pode cair numa listagem completa do Drive
+			# (minutos de rclone e escrita no SQLite que bloqueia o FUSE).
+			raise FastOneDriveError(f"Graph indisponível; poll adiado: {error}") from error
 		logError(f"Graph indisponível, a usar rclone: {error}")
 		return _rebuildRclone(
 			connection,
@@ -1794,7 +1452,10 @@ def _rebuildGraph(connection: sqlite3.Connection, root: str, startedAt: str) -> 
 	if orphans == 0:
 		if newRootLink == "":
 			raise GraphDeltaExpired("delta sem deltaLink")
-		_saveDeltaState(connection, "root", "", "", newRootLink, "")
+		# Em modo completo o cursor da raiz só avança se a limpeza puder correr;
+		# falha numa partilha não pode deixar o índice sem purge para sempre.
+		if mode != "completo":
+			_saveDeltaState(connection, "root", "", "", newRootLink, "")
 	else:
 		logError(
 			"delta com itens por resolver; cursor mantido",
@@ -1802,7 +1463,11 @@ def _rebuildGraph(connection: sqlite3.Connection, root: str, startedAt: str) -> 
 		)
 	for scope, (driveId, remoteId, prefixPath) in list(shared.items()):
 		sharedState: dict[str, str] | None = _loadDeltaState(connection, scope)
-		sharedLink: str = str(sharedState["deltaLink"]) if sharedState is not None else ""
+		# Em modo completo a partilha também enumera desde o início; senão
+		# _dropUnseenRows apaga pins e linhas que o delta incremental não viu.
+		sharedLink: str = ""
+		if mode != "completo" and sharedState is not None:
+			sharedLink = str(sharedState["deltaLink"])
 		try:
 			sharedPages, sharedHolder = iterItemDelta(driveId, remoteId, sharedLink)
 			count, shared, sharedOrphans = _applyDeltaFeed(
@@ -1818,6 +1483,7 @@ def _rebuildGraph(connection: sqlite3.Connection, root: str, startedAt: str) -> 
 				prefixPath,
 				remoteId,
 				shared,
+				scopeId=scope,
 			)
 		except GraphDeltaExpired:
 			raise
@@ -1830,7 +1496,12 @@ def _rebuildGraph(connection: sqlite3.Connection, root: str, startedAt: str) -> 
 					extra={"scope": scope},
 				)
 				continue
-			raise
+			incomplete = True
+			logError(
+				f"delta da pasta partilhada falhou: {error}",
+				extra={"scope": scope},
+			)
+			continue
 		if sharedOrphans == 0:
 			sharedLinkNext: str = sharedHolder[0]
 			if sharedLinkNext == "":
@@ -1863,8 +1534,14 @@ def _rebuildGraph(connection: sqlite3.Connection, root: str, startedAt: str) -> 
 				"delta com itens por resolver; cursor mantido",
 				extra={"orphans": sharedOrphans, "scope": scope},
 			)
-	if mode == "completo" and not incomplete:
+	if mode == "completo" and orphans == 0 and not incomplete:
+		_saveDeltaState(connection, "root", "", "", newRootLink, "")
 		_dropUnseenRows(connection, seen, "", startedAt)
+	elif mode == "completo" and incomplete:
+		logError(
+			"ciclo completo incompleto; cursor da raiz mantido",
+			extra={"orphans": orphans},
+		)
 	connection.commit()
 	return count
 
@@ -1934,6 +1611,7 @@ def _applyDeltaFeed(
 	prefix: str,
 	scopeRootId: str,
 	shared: dict[str, tuple[str, str, str]],
+	scopeId: str = "",
 ) -> tuple[int, dict[str, tuple[str, str, str]], int]:
 	pending: list[dict[str, Any]] = []
 	deletes: dict[str, dict[str, Any]] = {}
@@ -1954,6 +1632,7 @@ def _applyDeltaFeed(
 			prefix,
 			scopeRootId,
 			shared,
+			scopeId,
 		)
 		applied += added
 		deferred.extend(left)
@@ -1992,6 +1671,7 @@ def _applyDeltaFeed(
 			prefix,
 			scopeRootId,
 			shared,
+			scopeId,
 		)
 		applied += addedOrphans
 	applied += _flushDeltaDeletes(connection, list(deletes.values()), ids, seen, shared)
@@ -2116,6 +1796,7 @@ def _flushDeltaPending(
 	prefix: str,
 	scopeRootId: str,
 	shared: dict[str, tuple[str, str, str]],
+	scopeId: str = "",
 ) -> tuple[int, list[dict[str, Any]]]:
 	updatedAt: str = datetime.now(timezone.utc).isoformat(timespec="seconds")
 	remaining: list[dict[str, Any]] = list(pending)
@@ -2201,6 +1882,10 @@ def _flushDeltaPending(
 			)
 			ids[itemId] = itemPath
 			parents[itemId] = str(parsed["parentId"])
+			# A raiz do scope mantém o id do atalho no SQLite; o id remoto
+			# fica só no mapa em memória para resolver filhos do delta.
+			if scopeId != "" and itemPath == prefix:
+				ids[scopeId] = itemPath
 			placed.append(parsed)
 		parsedItem: dict[str, Any]
 		for parsedItem in placed:
@@ -2208,6 +1893,9 @@ def _flushDeltaPending(
 			placedPath: str = ids.get(placedId, "")
 			if placedPath == "" or config.pathIsExcluded(placedPath):
 				continue
+			storedId: str = placedId
+			if scopeId != "" and placedPath == prefix:
+				storedId = scopeId
 			batch.append(
 				(
 					placedPath,
@@ -2218,7 +1906,7 @@ def _flushDeltaPending(
 					str(parsedItem["modTime"]),
 					str(parsedItem["mimeType"]),
 					str(parsedItem["etag"]),
-					placedId,
+					storedId,
 					updatedAt,
 					"",
 					"",
@@ -2264,7 +1952,12 @@ def _flushDeltaDeletes(
 		paths.append(itemPath)
 	paths.sort(key=lambda value: value.count("/"), reverse=True)
 	for itemPath in paths:
-		keptPaths: set[str] = _releaseVanishedTree(connection, itemPath)
+		# Sem baseline, sem estado protegido e sem cópia local, o item sai.
+		keptPaths: set[str] = _releaseVanishedTree(
+			connection,
+			itemPath,
+			keepUnsynced=False,
+		)
 		if itemPath in keptPaths:
 			connection.execute(
 				"""
@@ -2333,16 +2026,19 @@ def _releaseVanishedTree(
 		if any(other.startswith(childPrefix) for other in kept):
 			kept.add(path)
 			continue
-		_dropVanishedPath(connection, path, bool(row["isDir"]))
+		if not _dropVanishedPath(connection, path, bool(row["isDir"])):
+			# Cópia local não saiu: a linha fica para o ciclo seguinte tentar de novo.
+			kept.add(path)
 	return kept
 
 
-def _dropVanishedPath(connection: sqlite3.Connection, itemPath: str, isDir: bool) -> None:
+def _dropVanishedPath(connection: sqlite3.Connection, itemPath: str, isDir: bool) -> bool:
 	if not _removeVanishedCopies(itemPath, isDir):
-		return
+		return False
 	connection.execute("DELETE FROM files WHERE path = ?", (itemPath,))
 	connection.execute("DELETE FROM file_chunks WHERE path = ?", (itemPath,))
 	connection.execute("DELETE FROM chunk_writes WHERE path = ?", (itemPath,))
+	return True
 
 
 def _keepVanished(state: str) -> bool:
@@ -2473,12 +2169,23 @@ def _displaceOccupiedTree(
 		return ""
 	if oldPath.startswith(f"{newPath}/"):
 		return ""
+	from fastonedrive.disk import pathPresent
+	from fastonedrive.search import cacheLocalPath, pinnedLocalPath, relocateStoredFiles
+
 	destRow: sqlite3.Row | None = connection.execute(
 		"SELECT itemId FROM files WHERE path = ?",
 		(newPath,),
 	).fetchone()
-	if destRow is None:
+	hasLocal: bool = pathPresent(pinnedLocalPath(newPath)) or pathPresent(
+		cacheLocalPath(newPath)
+	)
+	if destRow is None and not hasLocal:
 		return ""
+	if destRow is None:
+		# Cópia só no disco, sem linha: não pode ser apagada pelo rename da nuvem.
+		conflict: str = _uniqueConflictItem(connection, newPath)
+		relocateStoredFiles(newPath, conflict)
+		return conflict
 	sourceRow: sqlite3.Row | None = connection.execute(
 		"SELECT itemId FROM files WHERE path = ?",
 		(oldPath,),
@@ -2488,9 +2195,7 @@ def _displaceOccupiedTree(
 	if destId != "" and destId == sourceId:
 		return ""
 	dirty: bool = _storedTreeDirty(connection, newPath)
-	conflict: str = _uniqueConflictItem(connection, newPath)
-	from fastonedrive.search import relocateStoredFiles
-
+	conflict = _uniqueConflictItem(connection, newPath)
 	relocateStoredFiles(newPath, conflict)
 	_moveIndexPaths(connection, newPath, conflict, updatedAt)
 	if dirty:
@@ -2799,9 +2504,18 @@ def _dropUnseenRows(
 		if _hiddenFromListing(path):
 			keepUnder.add(path)
 			continue
-		if _keepVanished(state) or base == "":
+		if _keepVanished(state):
 			keepUnder.add(path)
 			continue
+		# Baseline vazia só protege se ainda há cópia local; ficheiros só na
+		# nuvem apagados no ciclo completo têm de sair do índice.
+		if base == "":
+			from fastonedrive.disk import pathPresent
+			from fastonedrive.search import cacheLocalPath, pinnedLocalPath
+
+			if pathPresent(pinnedLocalPath(path)) or pathPresent(cacheLocalPath(path)):
+				keepUnder.add(path)
+				continue
 		missing.append((path, bool(row["isDir"])))
 	missing.sort(key=lambda item: item[0].count("/"), reverse=True)
 	dropped: tuple[str, bool]
@@ -2810,7 +2524,8 @@ def _dropUnseenRows(
 		childPrefix: str = f"{path}/"
 		if any(other.startswith(childPrefix) for other in keepUnder):
 			continue
-		_dropVanishedPath(connection, path, isDir)
+		if not _dropVanishedPath(connection, path, isDir):
+			keepUnder.add(path)
 	connection.commit()
 
 
@@ -2852,12 +2567,9 @@ def _rowFromLsjson(
 	path: str
 	if prefix == "":
 		path = relative
-	elif relative == prefix or relative.startswith(f"{prefix}/"):
-		path = relative
 	else:
+		# lsjson devolve Path relativo à pasta listada; prefixar sempre.
 		path = f"{prefix}/{relative}"
-	if path == prefix:
-		return None
 	parent: str
 	if "/" in path:
 		parent = path.rsplit("/", 1)[0]
@@ -2891,3 +2603,14 @@ def _likeEscape(text: str) -> str:
 		.replace("%", "\\%")
 		.replace("_", "\\_")
 	)
+
+
+# Listagem em segundo plano vive em listing.py; os nomes públicos continuam a sair daqui.
+from fastonedrive.listing import (  # noqa: E402
+	ensureFolderListed as ensureFolderListed,
+	invalidateListing as invalidateListing,
+	listingCompleted as listingCompleted,
+	markListingCompleted as markListingCompleted,
+	runParentRefresh as runParentRefresh,
+	scheduleParentRefresh as scheduleParentRefresh,
+)

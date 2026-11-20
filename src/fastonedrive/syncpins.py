@@ -7,6 +7,7 @@ from typing import Any
 
 from fastonedrive import FastOneDriveError
 from fastonedrive import config
+from fastonedrive.log import logError
 from fastonedrive.activity import setActivity
 from fastonedrive.disk import (
 	assertFreeSpace,
@@ -57,8 +58,8 @@ from fastonedrive.rclone import (
 	parseRemoteModTime,
 	quickXorEqual,
 	remoteSizeBytes,
-	mkdirRemote,
 	remoteStat,
+	sameToken,
 	statSize,
 	rmdirRemote,
 	tokenKind,
@@ -67,6 +68,11 @@ from fastonedrive.rclone import (
 from fastonedrive.search import cacheLocalPath, pinnedLocalPath
 
 MTIME_SKEW: timedelta = timedelta(seconds=2)
+# Acima disto, sem reflink, copiar para um instantâneo custa mais do que segurar o
+# ficheiro durante o envio.
+SNAPSHOT_COPY_MAX_BYTES: int = 64 * 1024 * 1024
+FICLONE: int = 0x40049409
+DOWNLOAD_MARK: str = "descarga"
 _dirtyRedirects: set[str] = set()
 
 
@@ -89,7 +95,17 @@ def _syncPinsLocked(
 	onStats: Callable[[str], None] | None,
 	itemPath: str | None,
 ) -> dict[str, int]:
-	pruneJobArtifacts(config.ensureCacheDir(), includePartials=True, recursive=True)
+	target: str = (itemPath or "").strip().strip("/")
+	if target == "":
+		pruneJobArtifacts(config.ensureCacheDir(), includePartials=True, recursive=True)
+		_pruneUploadSnapshots()
+	else:
+		# Envio de um só ficheiro (cada gravação): percorrer a cache inteira com rglob
+		# pesava em cada Ctrl+S; basta a pasta do item.
+		pruneJobArtifacts(
+			cacheLocalPath(parentPath(target)) if "/" in target else config.ensureCacheDir(),
+			includePartials=True,
+		)
 	stats: dict[str, int] = {
 		"downloaded": 0,
 		"uploaded": 0,
@@ -99,7 +115,6 @@ def _syncPinsLocked(
 		"conflicts": 0,
 		"errors": 0,
 	}
-	target: str = (itemPath or "").strip().strip("/")
 	if target != "" and isEphemeralPath(target):
 		return stats
 	setActivity("syncing", target if target != "" else "pins")
@@ -111,6 +126,7 @@ def _syncPinsLocked(
 		else:
 			_syncPinnedRows(stats, onStats, pendingDirs)
 			_syncDirtyDirectories(stats)
+			_dropOrphanRows(stats)
 			_syncDirtyCache(stats, onStats, None)
 		_flushPendingRmdirs(pendingDirs, stats)
 		setActivity("idle", "")
@@ -159,8 +175,16 @@ def _syncOnePath(
 	if kind == "blocked":
 		return
 	remotePath: str = config.remotePath(itemPath)
+	if entry is None and kind == "missing":
+		# Temporário de editor (QSaveFile "nome.txt.XXXXXX") já renomeado: nada no índice
+		# nem no disco. Antes custava um rclone stat (segundos) à frente do envio real.
+		stats["skipped"] += 1
+		return
 	try:
-		stat = remoteStat(remotePath)
+		stat = quickStat(itemPath, remotePath)
+	except OfflineError:
+		_retryOffline(itemPath, stats)
+		return
 	except FastOneDriveError:
 		stats["errors"] += 1
 		setSyncState(itemPath, SYNC_ERROR, "stat remoto falhou")
@@ -180,14 +204,6 @@ def _syncOnePath(
 	localExists: bool = local is not None and local.is_file()
 	if localExists and remoteExists:
 		assert stat is not None and local is not None
-		baseEtag: str = str(entry["baseEtag"] or "") if entry is not None else ""
-		if entry is None or baseEtag == "":
-			_resolveBothExist(itemPath, local, stat, stats, onStats)
-			return
-		rowPinned: bool = entry is not None and bool(entry["pinned"])
-		if not rowPinned and not pinnedLocalPath(itemPath).is_file() and isCacheDirty(itemPath):
-			_uploadLocal(itemPath, local, stats, onStats)
-			return
 		_resolveBothExist(itemPath, local, stat, stats, onStats)
 		return
 	if remoteExists and not localExists:
@@ -197,12 +213,51 @@ def _syncOnePath(
 		assert local is not None
 		_resolveLocalOnly(itemPath, local, stats, onStats)
 		return
+	if _orphanLocalRow(itemPath, entry):
+		# Criado aqui, nunca subiu, e a cópia local desapareceu: a linha só mostrava
+		# um ficheiro fantasma de 0 bytes.
+		deleteIndexTree(itemPath)
+		stats["deletedLocal"] += 1
+		return
 	stats["skipped"] += 1
 
 
-def _publishDirtyDirectory(itemPath: str, stats: dict[str, int]) -> bool:
+def _dropOrphanRows(stats: dict[str, int]) -> None:
+	itemPath: str
+	for itemPath in listDirtyPaths(""):
+		if isEphemeralPath(itemPath):
+			continue
+		if _orphanLocalRow(itemPath, getEntry(itemPath)):
+			deleteIndexTree(itemPath)
+			stats["deletedLocal"] += 1
+
+
+def _orphanLocalRow(itemPath: str, entry: object) -> bool:
+	if entry is None:
+		return False
 	try:
-		mkdirRemote(config.remotePath(itemPath))
+		if bool(entry["isDir"]):  # type: ignore[index]
+			return False
+		for key in ("itemId", "etag", "baseEtag"):
+			if str(entry[key] or "") != "":  # type: ignore[index]
+				return False
+	except (KeyError, IndexError, TypeError):
+		return False
+	if writeGuardHeld(itemPath):
+		return False
+	return not pinnedLocalPath(itemPath).exists() and not cacheLocalPath(itemPath).exists()
+
+
+def _publishDirtyDirectory(itemPath: str, stats: dict[str, int]) -> bool:
+	from fastonedrive import graphitems
+	from fastonedrive.mutate import mkdirRemoteFast
+
+	try:
+		mkdirRemoteFast(itemPath)
+		return True
+	except graphitems.GraphUnreachable:
+		_retryOffline(itemPath, stats)
+		return False
 	except FastOneDriveError as error:
 		if not _remoteDirExists(itemPath):
 			stats["errors"] += 1
@@ -211,6 +266,21 @@ def _publishDirtyDirectory(itemPath: str, stats: dict[str, int]) -> bool:
 	setSyncState(itemPath, "")
 	notifyDirChanged(itemPath)
 	return True
+
+
+OFFLINE_RETRY_SEC: float = 60.0
+
+
+class OfflineError(FastOneDriveError):
+	"""Sem rede: o item fica dirty e volta a tentar, sem emblema de erro."""
+
+
+def _retryOffline(itemPath: str, stats: dict[str, int]) -> None:
+	from fastonedrive.watcher import debounceSync
+
+	stats["skipped"] += 1
+	setSyncState(itemPath, SYNC_DIRTY, "sem rede")
+	debounceSync(itemPath, OFFLINE_RETRY_SEC)
 
 
 def _remoteDirExists(itemPath: str) -> bool:
@@ -486,6 +556,13 @@ def _resolveHashedBaseline(
 		adoptDownloadedFile(itemPath, local, stat)
 		stats["skipped"] += 1
 		return
+	if matched is False and _replacedKnownVersion(itemPath, stat):
+		# Substituir no explorador um ficheiro que nunca foi aberto aqui (sem base): se a
+		# nuvem ainda é a versão que o índice conhecia, ninguém a mudou entretanto e a
+		# versão nova sobe por cima, como no Windows. Antes, cada substituição gerava
+		# uma cópia "(conflito local …)".
+		_uploadLocal(itemPath, local, stats, onStats)
+		return
 	if matched is False:
 		_writeConflict(
 			itemPath,
@@ -544,6 +621,26 @@ def _resolveHashedBaseline(
 		stat,
 		stats,
 		onStats,
+	)
+
+
+def _replacedKnownVersion(itemPath: str, stat: dict[str, object]) -> bool:
+	entry = getEntry(itemPath)
+	if entry is None or str(entry["baseEtag"] or "") != "":
+		return False
+	if str(entry["syncState"] or "") not in (SYNC_DIRTY, SYNC_SYNCING):
+		return False
+	known: str = str(entry["etag"] or "")
+	remote: str = contentTokenFromStat(stat)  # type: ignore[arg-type]
+	if known == "" or remote == "":
+		return False
+	return not tokensDiffer(
+		known,
+		remote,
+		parseRemoteModTime(str(entry["modTime"] or "")),
+		parseRemoteModTime(str(stat.get("ModTime") or "")),
+		int(entry["size"] or 0) or None,
+		statSize(stat),
 	)
 
 
@@ -808,6 +905,17 @@ def _resolveLocalOnly(
 	stats["deletedLocal"] += 1
 
 
+def _isDownloadState(entry: object) -> bool:
+	if entry is None:
+		return False
+	try:
+		state: str = str(entry["syncState"] or "")  # type: ignore[index]
+		error: str = str(entry["syncError"] or "")  # type: ignore[index]
+	except (IndexError, KeyError, TypeError):
+		return False
+	return state in ("syncing", "error") and error.startswith(DOWNLOAD_MARK)
+
+
 def _localChanged(
 	localTime: datetime,
 	baseTime: datetime | None,
@@ -818,7 +926,7 @@ def _localChanged(
 			state: str = str(entry["syncState"] or "")  # type: ignore[index]
 		except (IndexError, KeyError, TypeError):
 			state = ""
-		if state in ("dirty", "syncing", "conflict", "error"):
+		if state in ("dirty", "syncing", "conflict", "error") and not _isDownloadState(entry):
 			return True
 	if baseTime is None:
 		return True
@@ -860,9 +968,9 @@ def _adoptOrSend(
 		adoptDownloadedFile(itemPath, local, stat)
 		stats["skipped"] += 1
 		return
-	localEdited: bool = state in ("dirty", "syncing", "conflict", "error") or (
-		remoteTime is not None and localTime > remoteTime + MTIME_SKEW
-	)
+	localEdited: bool = (
+		state in ("dirty", "syncing", "conflict", "error") and not _isDownloadState(entry)
+	) or (remoteTime is not None and localTime > remoteTime + MTIME_SKEW)
 	if localEdited:
 		_writeConflict(
 			itemPath,
@@ -891,7 +999,7 @@ def _sameBytes(
 	localKind: str = tokenKind(localToken)
 	remoteKind: str = tokenKind(remoteToken)
 	if localKind != "" and localKind == remoteKind:
-		return localToken == remoteToken
+		return sameToken(localToken, remoteToken)
 	if remoteTime is None:
 		return False
 	if abs((localTime - remoteTime).total_seconds()) > MTIME_SKEW.total_seconds():
@@ -938,45 +1046,212 @@ def _uploadLocal(
 			return
 		if promoted[0] == "file" and promoted[1] is not None:
 			payload = promoted[1]
+	snapshot: Path | None = None
+	signature: tuple[int, int, int] | None = None
 	with tryExclusiveWriteGuard(itemPath) as held:
 		if not held:
 			stats["skipped"] += 1
+			from fastonedrive.watcher import RETRY_SEC, debounceSync
+
+			debounceSync(itemPath, RETRY_SEC)
 			return
 		if not _ensureFilled(itemPath, payload):
 			stats["errors"] += 1
 			return
-		setSyncState(itemPath, SYNC_SYNCING)
-		setActivity("syncing", itemPath)
-		try:
-			copyFromLocal(str(payload), config.remotePath(itemPath), onStats)
-			stat = remoteStat(config.remotePath(itemPath))
-			modTime: str = ""
-			size: int = int(payload.stat().st_size)
-			if stat is not None:
-				modTime = str(stat.get("ModTime") or "")
-				size = int(stat.get("Size") or size)
-			if getEntry(itemPath) is None:
-				upsertEntry(
-					itemPath,
-					payload.name,
-					False,
-					size,
-					None,
-					modTime,
-					"",
-					contentTokenFromStat(stat) if stat is not None else "",
-					str(stat.get("ID") or "") if stat is not None else "",
-				)
-			if stat is None:
-				setSyncState(itemPath, SYNC_ERROR, "stat após envio falhou")
-				stats["errors"] += 1
-				return
-			adoptDownloadedFile(itemPath, payload, stat)
-			stats["uploaded"] += 1
-			notifyDirChanged(parentPath(itemPath))
-		except FastOneDriveError as error:
-			setSyncState(itemPath, SYNC_ERROR, str(error))
+		problem: str = unsafeUploadReason(itemPath, payload)
+		if problem != "":
+			logError(f"envio recusado: {problem}", extra={"path": itemPath})
+			setSyncState(itemPath, SYNC_ERROR, problem)
 			stats["errors"] += 1
+			return
+		setSyncState(itemPath, SYNC_SYNCING)
+		setActivity("syncing", itemPath, "upload")
+		# O envio vai de um instantâneo: o write guard exclusivo durante o rclone
+		# bloqueava o open() de escrita do editor (Ctrl+S) durante todo o envio (~15 s).
+		snapshot, signature = _uploadSnapshot(itemPath, payload)
+		if snapshot is None:
+			_sendAndAdopt(itemPath, payload, payload, None, stats, onStats)
+			return
+	try:
+		_sendAndAdopt(itemPath, payload, snapshot, signature, stats, onStats)
+	finally:
+		snapshot.unlink(missing_ok=True)
+
+
+def _pruneUploadSnapshots() -> None:
+	import time
+
+	root: Path = config.dataDir() / "upload-snapshots"
+	if not root.is_dir():
+		return
+	cutoff: float = time.time() - 6 * 3600
+	for child in root.iterdir():
+		try:
+			if child.is_file() and child.stat().st_mtime < cutoff and child.stat().st_ctime < cutoff:
+				child.unlink(missing_ok=True)
+		except OSError:
+			continue
+
+
+def _fileSignature(path: Path) -> tuple[int, int, int] | None:
+	try:
+		info: os.stat_result = path.stat()
+	except OSError:
+		return None
+	return int(info.st_ino), int(info.st_size), int(info.st_mtime_ns)
+
+
+def _uploadSnapshot(itemPath: str, payload: Path) -> tuple[Path | None, tuple[int, int, int] | None]:
+	"""Cópia (reflink se o disco deixar) do ficheiro a enviar, com o mesmo mtime."""
+	import fcntl
+	import hashlib
+
+	signature: tuple[int, int, int] | None = _fileSignature(payload)
+	if signature is None:
+		return None, None
+	root: Path = config.dataDir() / "upload-snapshots"
+	try:
+		root.mkdir(parents=True, exist_ok=True)
+	except OSError:
+		return None, None
+	digest: str = hashlib.sha256(itemPath.encode("utf-8")).hexdigest()
+	target: Path = root / f"{digest}-{os.getpid()}"
+	cloned: bool = False
+	try:
+		with payload.open("rb") as source, target.open("wb") as dest:
+			try:
+				fcntl.ioctl(dest.fileno(), FICLONE, source.fileno())
+				cloned = True
+			except OSError:
+				cloned = False
+		if not cloned:
+			if signature[1] > SNAPSHOT_COPY_MAX_BYTES:
+				target.unlink(missing_ok=True)
+				return None, None
+			copy2(payload, target)
+		info: os.stat_result = payload.stat()
+		os.utime(target, ns=(int(info.st_atime_ns), int(info.st_mtime_ns)))
+	except OSError:
+		target.unlink(missing_ok=True)
+		return None, None
+	return target, signature
+
+
+def _sendAndAdopt(
+	itemPath: str,
+	payload: Path,
+	source: Path,
+	signature: tuple[int, int, int] | None,
+	stats: dict[str, int],
+	onStats: Callable[[str], None] | None,
+) -> None:
+	"""Envia source; adopta a versão enviada como base de payload.
+
+	signature None = o write guard exclusivo está seguro por quem chama (caminho antigo).
+	Senão, payload pode ter mudado durante o envio: só se adopta se está igual.
+	"""
+	try:
+		stat = _sendFile(itemPath, source, onStats)
+		modTime: str = ""
+		size: int = int(source.stat().st_size)
+		if stat is not None:
+			modTime = str(stat.get("ModTime") or "")
+			size = int(stat.get("Size") or size)
+		if getEntry(itemPath) is None:
+			upsertEntry(
+				itemPath,
+				payload.name,
+				False,
+				size,
+				None,
+				modTime,
+				"",
+				contentTokenFromStat(stat) if stat is not None else "",
+				str(stat.get("ID") or "") if stat is not None else "",
+			)
+		if stat is None:
+			setSyncState(itemPath, SYNC_ERROR, "stat após envio falhou")
+			stats["errors"] += 1
+			return
+		from fastonedrive.index import setItemIdIfMissing
+
+		setItemIdIfMissing(itemPath, str(stat.get("ID") or ""))
+		if signature is None:
+			adoptDownloadedFile(itemPath, payload, stat)
+		else:
+			_adoptIfUnchanged(itemPath, payload, signature, stat)
+		stats["uploaded"] += 1
+		notifyDirChanged(parentPath(itemPath))
+	except OfflineError:
+		_retryOffline(itemPath, stats)
+	except FastOneDriveError as error:
+		setSyncState(itemPath, SYNC_ERROR, str(error))
+		stats["errors"] += 1
+
+
+def _sendFile(
+	itemPath: str,
+	source: Path,
+	onStats: Callable[[str], None] | None,
+) -> dict[str, Any] | None:
+	"""Ficheiro pequeno: PUT directo no Graph (< 1 s). Grande, ou o Graph recusou: rclone."""
+	from fastonedrive import graphitems
+	from fastonedrive.synccontrol import load
+
+	remotePath: str = config.remotePath(itemPath)
+	small: bool = int(source.stat().st_size) <= graphitems.SIMPLE_UPLOAD_MAX_BYTES
+	# Com limite de banda configurado, o rclone respeita-o; o PUT directo não.
+	if small and load().bwLimit == "":
+		try:
+			return graphitems.uploadSmallFile(itemPath, source)
+		except graphitems.GraphUnreachable as error:
+			raise OfflineError(str(error)) from error
+		except FastOneDriveError as error:
+			logError(f"envio Graph falhou, a usar rclone: {error}", extra={"path": itemPath})
+	copyFromLocal(str(source), remotePath, onStats)
+	return quickStat(itemPath, remotePath)
+
+
+def _adoptIfUnchanged(
+	itemPath: str,
+	payload: Path,
+	signature: tuple[int, int, int],
+	stat: dict[str, Any],
+) -> None:
+	from fastonedrive.index import setBaseline
+
+	with tryExclusiveWriteGuard(itemPath) as held:
+		if held and _fileSignature(payload) == signature:
+			adoptDownloadedFile(itemPath, payload, stat)
+			return
+	# Gravado outra vez durante o envio: a nuvem tem a versão anterior, que passa a
+	# ser a base (o próximo envio não é conflito); a cópia local continua por enviar.
+	token: str = contentTokenFromStat(stat)
+	if token != "":
+		setBaseline(itemPath, str(stat.get("ModTime") or ""), token, int(stat.get("Size") or 0), keepSyncState=True)
+	markDirty(itemPath)
+	from fastonedrive.watcher import RETRY_SEC, debounceSync
+
+	debounceSync(itemPath, RETRY_SEC)
+
+
+def quickStat(itemPath: str, remotePath: str) -> dict[str, Any] | None:
+	"""Stat pelo Graph (~0,2 s) em vez de arrancar o rclone (vários segundos)."""
+	from fastonedrive import graphitems
+
+	entry = getEntry(itemPath)
+	known: bool = entry is not None and str(entry["itemId"] or "") != ""
+	try:
+		return graphitems.graphStat(itemPath)[0]
+	except graphitems.GraphItemGone:
+		if not known:
+			# Sem itemId o URL é por caminho: 404 quer dizer que não existe.
+			return None
+	except graphitems.GraphUnreachable as error:
+		raise OfflineError(str(error)) from error
+	except FastOneDriveError:
+		pass
+	return remoteStat(remotePath)
 
 
 def _downloadBlocked(itemPath: str, allowDirty: bool) -> bool:
@@ -988,6 +1263,8 @@ def _downloadBlocked(itemPath: str, allowDirty: bool) -> bool:
 	if entry is None:
 		return False
 	state: str = str(entry["syncState"] or "")
+	if _isDownloadState(entry):
+		return False
 	return state in ("dirty", "syncing", "conflict", "error")
 
 
@@ -1026,8 +1303,8 @@ def _downloadLocked(
 		return
 	protectCache: bool = _dirtyCacheBeside(itemPath, target)
 	if not protectCache:
-		setSyncState(itemPath, SYNC_SYNCING)
-	setActivity("syncing", itemPath)
+		setSyncState(itemPath, SYNC_SYNCING, DOWNLOAD_MARK)
+	setActivity("syncing", itemPath, "download")
 	try:
 		size: int = remoteSizeBytes(
 			config.remotePath(itemPath),
@@ -1043,14 +1320,20 @@ def _downloadLocked(
 		if target == pinnedLocalPath(itemPath) or getEntry(itemPath) is None:
 			upsertPinned(itemPath, True, target.name, False, size)
 		if stat is None:
-			setSyncState(itemPath, SYNC_ERROR, "stat após descarga falhou")
+			setSyncState(itemPath, SYNC_ERROR, f"{DOWNLOAD_MARK}: stat após descarga falhou")
 			stats["errors"] += 1
 			return
-		adoptDownloadedFile(itemPath, target, stat, protectCache)
+		adoptDownloadedFile(
+			itemPath,
+			target,
+			stat,
+			protectCache,
+			True,
+		)
 		stats["downloaded"] += 1
 		notifyDirChanged(parentPath(itemPath))
 	except FastOneDriveError as error:
-		setSyncState(itemPath, SYNC_ERROR, str(error))
+		setSyncState(itemPath, SYNC_ERROR, f"{DOWNLOAD_MARK}: {error}")
 		stats["errors"] += 1
 
 
@@ -1059,7 +1342,63 @@ def _downloadStateBlocked(itemPath: str) -> bool:
 	if entry is None:
 		return False
 	state: str = str(entry["syncState"] or "")
+	if _isDownloadState(entry):
+		return False
 	return state in ("dirty", "syncing", "conflict", "error")
+
+
+CONFLICT_MARK: str = "(conflito local "
+HOLLOW_MIN_BYTES: int = 1024 * 1024
+
+
+def holeBytes(path: Path) -> int:
+	"""Bytes em buracos (SEEK_HOLE/SEEK_DATA). 0 se o sistema de ficheiros não sabe."""
+	try:
+		size: int = int(path.stat().st_size)
+		fd: int = os.open(str(path), os.O_RDONLY)
+	except OSError:
+		return 0
+	holes: int = 0
+	try:
+		offset: int = 0
+		while offset < size:
+			try:
+				hole: int = os.lseek(fd, offset, os.SEEK_HOLE)
+			except OSError:
+				return 0
+			if hole >= size:
+				break
+			try:
+				data: int = os.lseek(fd, hole, os.SEEK_DATA)
+			except OSError:
+				data = size
+			holes += data - hole
+			offset = data
+	finally:
+		os.close(fd)
+	return holes
+
+
+def unsafeUploadReason(itemPath: str, local: Path) -> str:
+	"""Motivo para NÃO enviar este ficheiro por cima da nuvem, ou "".
+
+	Protege contra dois casos vistos na prática: uma cópia a pedido que perdeu o registo
+	dos blocos (ficheiro só com buracos/zeros) e um envio interrompido que deixou a
+	cópia local vazia. Nos dois, enviar apagava o conteúdo real na nuvem.
+	"""
+	try:
+		size: int = int(local.stat().st_size)
+	except OSError:
+		return "ficheiro local desapareceu"
+	if size >= HOLLOW_MIN_BYTES and holeBytes(local) * 2 >= size:
+		return "a cópia local está incompleta (buracos); não enviada para não estragar a nuvem"
+	entry = getEntry(itemPath)
+	if size == 0 and entry is not None:
+		known: int = int(entry["size"] or 0)
+		base: str = str(entry["baseEtag"] or "")
+		if known > 0 and base == "":
+			return "a cópia local ficou vazia depois de um envio interrompido; não enviada"
+	return ""
 
 
 def _writeConflict(
@@ -1069,7 +1408,21 @@ def _writeConflict(
 	stats: dict[str, int],
 	onStats: Callable[[str], None] | None,
 ) -> None:
+	if CONFLICT_MARK in local.name or CONFLICT_MARK in itemPath.rsplit("/", 1)[-1]:
+		# Nunca um conflito de um conflito. A cópia de conflito é nossa: se o envio
+		# anterior foi interrompido (mount off, reboot), a versão local ganha e sobe por
+		# cima. Antes, cada interrupção gerava "(conflito local A) (conflito local B)"
+		# e voltava a enviar o ficheiro inteiro.
+		_uploadLocal(itemPath, local, stats, onStats)
+		return
 	if not _readyToHash(itemPath, local, stats):
+		return
+	hollow: str = unsafeUploadReason(itemPath, local)
+	if hollow != "":
+		# Uma cópia de conflito de um ficheiro estragado só multiplica o estrago.
+		logError(f"conflito não criado: {hollow}", extra={"path": itemPath})
+		setSyncState(itemPath, SYNC_ERROR, hollow)
+		stats["errors"] += 1
 		return
 	with tryExclusiveWriteGuard(itemPath) as held:
 		if not held:

@@ -14,11 +14,25 @@ from fastonedrive import config
 from fastonedrive.hydrate import hydrateRemote
 from fastonedrive.index import indexProgress, startBackgroundIndex
 from fastonedrive.mount import applyMount, fastMountActive, fuseMountReady, legacyMountActive
-from fastonedrive.activity import readActivity
+from fastonedrive.activity import readActivity, readHistory
 from fastonedrive.rclone import listRemoteNames, probeRemote, rcloneVersion, remoteAbout
 from fastonedrive.search import rowToDict, search
 
 _UI_SOCKET_NAME: str = "fastonedrive-ui"
+
+
+def _loadAppIcon() -> Any:
+	from PyQt6.QtGui import QIcon
+
+	from fastonedrive.menus import APP_ICON_NAME, appIconPath
+
+	themed: QIcon = QIcon.fromTheme(APP_ICON_NAME)
+	if not themed.isNull():
+		return themed
+	path: Path | None = appIconPath()
+	if path is not None:
+		return QIcon(str(path))
+	return QIcon.fromTheme("folder-cloud")
 
 
 def runSettingsWindow(startHidden: bool = False) -> int:
@@ -73,6 +87,9 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 
 	def _themedIcon(name: str) -> QIcon:
 		return QIcon.fromTheme(name)
+
+	def _appIcon() -> QIcon:
+		return cast(QIcon, _loadAppIcon())
 
 	def _actionButton(text: str, iconName: str, slot: Callable[[], None]) -> QPushButton:
 		button: QPushButton = QPushButton(text)
@@ -168,6 +185,7 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 			self.openBridge = OpenBridge(self)
 			self.openBridge.finished.connect(self._onOpenFinished)
 			self.setWindowTitle("Fast-OneDrive")
+			self.setWindowIcon(_appIcon())
 			self.setMinimumSize(720, 540)
 			self.resize(820, 700)
 			self.setWindowFlag(Qt.WindowType.WindowContextHelpButtonHint, False)
@@ -436,6 +454,7 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 				[
 					self._indexGroup(),
 					self._quotaGroup(),
+					self._syncGroup(),
 					self._pinGroup(),
 					self._statusGroup("Estado Fast-OneDrive", self._fastStatusRows()),
 				],
@@ -725,6 +744,45 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 			self.extraEdit.setPlaceholderText("--transfers 8 --bwlimit off")
 			form.addRow("Flags extras:", self.extraEdit)
 			return box
+
+		def _syncGroup(self) -> QGroupBox:
+			box: QGroupBox = QGroupBox("Sincronização")
+			form: QFormLayout = QFormLayout(box)
+			form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignTop)
+			self.bwEdit = QLineEdit()
+			self.bwEdit.setPlaceholderText("sem limite  (ex.: 10M, ou 5M:20M para envio:descarga)")
+			self.meteredCheck = QCheckBox("Pausar em rede limitada (dados móveis, hotspot)")
+			self.pollSpin = QSpinBox()
+			self.pollSpin.setRange(15, 3600)
+			self.pollSpin.setSuffix(" s")
+			hint: QLabel = QLabel(
+				"As mudanças feitas noutros dispositivos aparecem em ~/OneDrive ao fim deste intervalo. "
+				"A pausa (bandeja → Pausar) e a rede limitada travam envios e descargas de fundo; "
+				"abrir um ficheiro continua a descarregá-lo."
+			)
+			hint.setWordWrap(True)
+			form.addRow("Limite de banda", self.bwEdit)
+			form.addRow("", self.meteredCheck)
+			form.addRow("Verificar a nuvem a cada", self.pollSpin)
+			form.addRow("", hint)
+			return box
+
+		def _loadSyncControl(self) -> None:
+			from fastonedrive.synccontrol import load
+
+			control = load()
+			self.bwEdit.setText(control.bwLimit)
+			self.meteredCheck.setChecked(control.pauseOnMetered)
+			self.pollSpin.setValue(int(control.remotePollSeconds))
+
+		def _saveSyncControl(self) -> None:
+			from fastonedrive.synccontrol import load, save
+
+			control = load()
+			control.bwLimit = self.bwEdit.text().strip()
+			control.pauseOnMetered = self.meteredCheck.isChecked()
+			control.remotePollSeconds = int(self.pollSpin.value())
+			save(control)
 
 		def _pinGroup(self) -> QGroupBox:
 			box: QGroupBox = QGroupBox("Manter localmente e abrir")
@@ -1052,6 +1110,7 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 			self.extraEdit.setText(str(flags["rcloneExtra"]))
 			openMb: int = config.bytesToMb(config.openMaxBytes())
 			self.openSpin.setValue(openMb if openMb > 0 else 1)
+			self._loadSyncControl()
 			self._setSkipPinValues(list(config.skipPinSegments()))
 			self._refreshFastStatus()
 			self._refreshQuota()
@@ -1070,6 +1129,7 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 			)
 
 		def _persist(self, applyFuse: bool = False) -> Path:
+			self._saveSyncControl()
 			skipPin: list[str] = self._skipPinValues()
 			exclude: list[str] = [
 				part.strip() for part in self.excludeEdit.text().split(",")
@@ -1175,7 +1235,8 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 			QMessageBox.information(
 				self,
 				"Fast-OneDrive",
-				f"Copiado {config.systemRcloneConfigPath()} para {path}. O ficheiro do mount não foi alterado.",
+				f"Os remotes de {config.systemRcloneConfigPath()} que faltavam foram juntados a {path}. "
+				"Os remotes que já existiam não foram alterados.",
 			)
 
 		def _refreshRemotes(self) -> None:
@@ -1370,6 +1431,7 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 	app.setQuitOnLastWindowClosed(False)
 	app.setApplicationName("Fast-OneDrive")
 	app.setDesktopFileName("fast-onedrive")
+	app.setWindowIcon(_appIcon())
 	if _activateRunningUi(not startHidden):
 		return 0
 	server: QLocalServer = QLocalServer()
@@ -1446,35 +1508,121 @@ def _installTray(app: object, parent: object, showWindow: Callable[[], None]) ->
 	qtApp: QApplication = cast(QApplication, app)
 	if not QSystemTrayIcon.isSystemTrayAvailable():
 		return None
-	icon: QIcon = QIcon.fromTheme("folder-cloud")
-	tray: QSystemTrayIcon = QSystemTrayIcon(icon, qtApp)
+	appIcon: QIcon = cast(QIcon, _loadAppIcon())
+	tray: QSystemTrayIcon = QSystemTrayIcon(appIcon, qtApp)
 	tray.setToolTip("Fast-OneDrive")
 	menu: QMenu = QMenu(cast(QWidget, parent))
-	openAction: QAction | None = menu.addAction("Abrir")
-	quitAction: QAction | None = menu.addAction("Sair")
+	# Como o menu do OneDrive no Windows: pasta, busca, web, actividade, pausa.
+	folderAction: QAction | None = menu.addAction(appIcon, "Abrir pasta OneDrive")
+	searchAction: QAction | None = menu.addAction(QIcon.fromTheme("search"), "Pesquisar no OneDrive…")
+	webAction: QAction | None = menu.addAction(QIcon.fromTheme("internet-web-browser"), "Ver online")
+	recycleAction: QAction | None = menu.addAction(QIcon.fromTheme("user-trash"), "Reciclagem do OneDrive")
+	recentMenu: QMenu | None = menu.addMenu(QIcon.fromTheme("view-history"), "Actividade recente")
+	menu.addSeparator()
+	pauseMenu: QMenu | None = menu.addMenu(QIcon.fromTheme("media-playback-pause"), "Pausar sincronização")
+	resumeAction: QAction | None = menu.addAction(QIcon.fromTheme("media-playback-start"), "Retomar sincronização")
+	menu.addSeparator()
+	openAction: QAction | None = menu.addAction(QIcon.fromTheme("configure"), "Definições")
+	quitAction: QAction | None = menu.addAction(QIcon.fromTheme("application-exit"), "Sair")
 	if openAction is not None:
 		openAction.triggered.connect(showWindow)
 	if quitAction is not None:
 		quitAction.triggered.connect(qtApp.quit)
+	if folderAction is not None:
+		folderAction.triggered.connect(lambda: _trayRun(["open-folder"]))
+	if searchAction is not None:
+		searchAction.triggered.connect(lambda: _trayRun(["dolphin-search"]))
+	if recycleAction is not None:
+		recycleAction.triggered.connect(lambda: _trayRun(["open-recycle"]))
+	if webAction is not None:
+		webAction.triggered.connect(lambda: _trayRun(["open-web", "--notify", str(config.mountPath())]))
+	if pauseMenu is not None:
+		for label, duration in (("2 horas", "2h"), ("8 horas", "8h"), ("24 horas", "24h")):
+			pauseItem: QAction | None = pauseMenu.addAction(label)
+			if pauseItem is not None:
+				pauseItem.triggered.connect(lambda _checked=False, value=duration: _trayRun(["pause", value]))
+	if resumeAction is not None:
+		resumeAction.triggered.connect(lambda: _trayRun(["resume"]))
+
+	def fillRecent() -> None:
+		if recentMenu is None:
+			return
+		recentMenu.clear()
+		entries: list[dict[str, Any]] = readHistory(10)
+		if len(entries) == 0:
+			empty: QAction | None = recentMenu.addAction("Sem actividade recente")
+			if empty is not None:
+				empty.setEnabled(False)
+			return
+		icons: dict[str, str] = {"upload": "cloud-upload", "download": "cloud-download", "error": "emblem-error"}
+		for entry in entries:
+			detail: str = str(entry.get("detail") or "")
+			kind: str = str(entry.get("kind") or "")
+			when: str = datetime.fromtimestamp(float(entry.get("time") or 0)).strftime("%H:%M")
+			name: str = detail.rsplit("/", 1)[-1] if kind != "error" else detail[:80]
+			entryIcon: QIcon = QIcon.fromTheme(icons.get(kind, ""))
+			if entryIcon.isNull():
+				entryIcon = appIcon
+			item: QAction | None = recentMenu.addAction(entryIcon, f"{when}  {name}")
+			if item is not None and kind in ("upload", "download"):
+				item.triggered.connect(lambda _checked=False, value=detail: _trayRun(["open-folder", value]))
+
+	def syncResumeVisibility() -> None:
+		from fastonedrive.synccontrol import load
+
+		paused: bool = load().pausedUntil > time.time()
+		if resumeAction is not None:
+			resumeAction.setVisible(paused)
+		pauseAction: QAction | None = pauseMenu.menuAction() if pauseMenu is not None else None
+		if pauseAction is not None:
+			pauseAction.setVisible(not paused)
+
+	def beforeShow() -> None:
+		fillRecent()
+		syncResumeVisibility()
+
+	menu.aboutToShow.connect(beforeShow)
 	tray.setContextMenu(menu)
 
 	def onActivated(reason: QSystemTrayIcon.ActivationReason) -> None:
 		if reason == QSystemTrayIcon.ActivationReason.Trigger:
 			showWindow()
 
+	stateIcons: dict[str, str] = {
+		"idle": "fastonedrive",
+		"syncing": "folder-sync",
+		"error": "dialog-warning",
+		"paused": "media-playback-pause",
+	}
+	lastIcon: list[str] = [""]
+
 	def refreshTip() -> None:
+		from fastonedrive.synccontrol import pauseReason
+
 		activity: dict[str, Any] = readActivity()
 		state: str = str(activity.get("state") or "idle")
+		detail: str = str(activity.get("detail") or "")
+		paused: str = pauseReason()
+		if paused != "" and state != "error":
+			state = "paused"
+			detail = paused
 		labels: dict[str, str] = {
-			"idle": "Inactivo",
+			"idle": "Actualizado",
 			"syncing": "A sincronizar",
 			"error": "Erro",
+			"paused": "Em pausa",
 		}
-		detail: str = str(activity.get("detail") or "")
 		tip: str = f"Fast-OneDrive — {labels.get(state, state)}"
 		if detail != "":
 			tip = f"{tip}\n{detail}"
 		tray.setToolTip(tip)
+		iconName: str = stateIcons.get(state, "fastonedrive")
+		if iconName != lastIcon[0]:
+			themed: QIcon = QIcon.fromTheme(iconName) if iconName != "fastonedrive" else appIcon
+			if themed.isNull():
+				themed = appIcon
+			tray.setIcon(themed)
+			lastIcon[0] = iconName
 
 	from PyQt6.QtCore import QTimer
 
@@ -1486,6 +1634,24 @@ def _installTray(app: object, parent: object, showWindow: Callable[[], None]) ->
 	tray.activated.connect(onActivated)
 	tray.show()
 	return tray
+
+
+def _trayRun(args: list[str]) -> None:
+	try:
+		binary: str = config.cliBin()
+	except FastOneDriveError:
+		return
+	profile: config.Profile | None = config.activeProfile()
+	command: list[str] = [binary]
+	if profile is not None and args[:1] not in (["pause"], ["resume"]):
+		command.extend(["--profile", profile.id])
+	subprocess.Popen(
+		[*command, *args],
+		start_new_session=True,
+		stdin=subprocess.DEVNULL,
+		stdout=subprocess.DEVNULL,
+		stderr=subprocess.DEVNULL,
+	)
 
 
 def _formatStamp(value: object) -> str:

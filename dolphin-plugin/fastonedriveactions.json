@@ -1,0 +1,11 @@
+{
+    "KPlugin": {
+        "Name": "OneDrive (Fast-OneDrive)",
+        "Description": "Manter neste dispositivo, libertar espaço, partilhar, ver online e versões",
+        "Icon": "folder-cloud",
+        "MimeTypes": [
+            "application/octet-stream",
+            "inode/directory"
+        ]
+    }
+}

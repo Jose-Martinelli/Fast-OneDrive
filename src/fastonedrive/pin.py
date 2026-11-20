@@ -39,22 +39,44 @@ from fastonedrive.rclone import (
 )
 from fastonedrive.search import pinnedLocalPath
 
+PIN_REFUSAL: str = "há alterações locais por enviar; nada foi mantido neste dispositivo"
+UNPIN_REFUSAL: str = "há alterações locais por enviar; nada foi deixado de manter"
+
 
 def pinRemote(source: str, onStats: Callable[[str], None] | None = None) -> str:
+	itemPath: str = remoteItemPath(toRemotePath(source))
+	if itemPath != "":
+		_flushPendingOrRefuse(itemPath, PIN_REFUSAL)
 	with pinsLock():
-		return _pinRemote(source, onStats)
+		if itemPath != "" and _treeNeedsUpload(itemPath):
+			raise FastOneDriveError(PIN_REFUSAL)
+		result: str = _pinRemote(source, onStats)
+	_notifyPinChange(source)
+	return result
+
+
+def _notifyPinChange(source: str) -> None:
+	"""O emblema muda logo (mantido / na nuvem), sem esperar que o Dolphin repinte."""
+	from fastonedrive.notify import notifyDirChanged, notifyStateChanged
+
+	try:
+		itemPath: str = remoteItemPath(toRemotePath(source))
+	except FastOneDriveError:
+		return
+	notifyStateChanged(itemPath)
+	notifyDirChanged(itemPath)
 
 
 def unpinRemote(source: str) -> str:
 	itemPath: str = remoteItemPath(toRemotePath(source))
 	if itemPath != "":
-		_flushPendingOrRefuse(itemPath)
+		_flushPendingOrRefuse(itemPath, UNPIN_REFUSAL)
 	with pinsLock():
 		if itemPath != "" and _treeNeedsUpload(itemPath):
-			raise FastOneDriveError(
-				"há alterações locais por enviar; nada foi deixado de manter"
-			)
-		return _unpinRemote(source)
+			raise FastOneDriveError(UNPIN_REFUSAL)
+		result: str = _unpinRemote(source)
+	_notifyPinChange(source)
+	return result
 
 
 def _pinRemote(source: str, onStats: Callable[[str], None] | None) -> str:
@@ -174,10 +196,14 @@ def freeLocalSpace(source: str) -> str:
 				raise FastOneDriveError(
 					"há alterações locais por enviar; o espaço não foi libertado"
 				)
+		from fastonedrive.chunks import deleteChunkTree
+
 		if cached.is_dir():
 			shutil.rmtree(cached)
 		else:
 			cached.unlink(missing_ok=True)
+		deleteChunkTree(itemPath)
+		_notifyPinChange(source)
 		return str(cached)
 	raise FastOneDriveError("nada local para libertar neste item")
 
@@ -278,6 +304,7 @@ def skipPinCopyFlags() -> list[str]:
 		if "*" in rule or "?" in rule:
 			pattern: str = rule
 			if not pattern.startswith("/") and not pattern.startswith("*"):
+				flags.extend(["--exclude", f"/{pattern}"])
 				pattern = f"**/{pattern}"
 			flags.extend(["--exclude", pattern])
 			continue
@@ -285,6 +312,8 @@ def skipPinCopyFlags() -> list[str]:
 			flags.extend(["--exclude", f"/{rule}/**"])
 			flags.extend(["--exclude", f"/{rule}"])
 			continue
+		flags.extend(["--exclude", f"/{rule}/**"])
+		flags.extend(["--exclude", f"/{rule}"])
 		flags.extend(["--exclude", f"**/{rule}/**"])
 		flags.extend(["--exclude", f"**/{rule}"])
 	return flags
@@ -386,26 +415,44 @@ def _pinnedDescendants(itemPath: str) -> list[str]:
 	return found
 
 
-def _flushPendingOrRefuse(itemPath: str) -> None:
+def _flushPendingOrRefuse(itemPath: str, refusal: str) -> None:
 	if not _treeNeedsUpload(itemPath):
 		return
 	from fastonedrive.syncpins import syncPins
 
 	syncPins(itemPath=itemPath)
 	if _treeNeedsUpload(itemPath):
-		raise FastOneDriveError(
-			"há alterações locais por enviar; nada foi deixado de manter"
-		)
+		raise FastOneDriveError(refusal)
 
 
 def _treeNeedsUpload(itemPath: str) -> bool:
+	from datetime import datetime, timedelta, timezone
+
+	from fastonedrive.rclone import parseRemoteModTime
+	from fastonedrive.search import cacheLocalPath
+
 	for row in listDescendants(itemPath):
 		state: str = str(row["syncState"] or "")
 		if state in ("dirty", "syncing", "conflict", "error"):
 			return True
+		if bool(row["isDir"]):
+			continue
 		path: str = str(row["path"])
-		if not bool(row["isDir"]) and isCacheDirty(path):
+		if isCacheDirty(path):
 			return True
+		if str(row["baseEtag"] or "") == "":
+			if pathPresent(pinnedLocalPath(path)) or pathPresent(cacheLocalPath(path)):
+				return True
+		base = parseRemoteModTime(str(row["baseModTime"] or ""))
+		if base is None:
+			continue
+		local: Path
+		for local in (pinnedLocalPath(path), cacheLocalPath(path)):
+			if not local.is_file():
+				continue
+			localTime: datetime = datetime.fromtimestamp(local.stat().st_mtime, tz=timezone.utc)
+			if localTime > base + timedelta(seconds=2):
+				return True
 	return False
 
 

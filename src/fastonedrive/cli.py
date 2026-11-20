@@ -46,11 +46,21 @@ def run(argv: Sequence[str] | None = None) -> int:
 	parser: argparse.ArgumentParser = _buildParser()
 	args: argparse.Namespace = parser.parse_args(raw)
 	command: str = str(getattr(args, "command", "") or "")
-	if command != "refresh-parent":
+	# index e refresh-parent: processos longos ou de fundo; o PDEATHSIG matava o
+	# index lançado por children/item quando o CLI curto saía.
+	if command not in ("refresh-parent", "index"):
 		armParentDeathSignal()
-	if command != "log":
+	# Comandos quentes do KIO/menus: não encher o log de produção.
+	_quietCli: frozenset[str] = frozenset(
+		("log", "rclone-password", "children", "item", "exists", "menu-if", "refresh-parent")
+	)
+	if command not in _quietCli:
 		logInfo(f"cli {command}", extra={"argv": raw})
 	try:
+		if command != "rclone-password":
+			from fastonedrive.secretconf import exportPasswordEnv
+
+			exportPasswordEnv()
 		_prepareProfile(args)
 		handler = args.handler
 		return int(handler(args))
@@ -283,6 +293,11 @@ def _buildParser() -> argparse.ArgumentParser:
 		default=None,
 		help="Sincronizar só este item (repetível; onedrive:PATH ou path do índice)",
 	)
+	syncParser.add_argument(
+		"--ignore-pause",
+		action="store_true",
+		help="Sincronizar mesmo com a pausa ou a rede limitada activas",
+	)
 	syncParser.set_defaults(handler=_cmdSyncPins)
 
 	fuseParser: argparse.ArgumentParser = sub.add_parser(
@@ -381,6 +396,29 @@ def _buildParser() -> argparse.ArgumentParser:
 	mountParser.add_argument("action", choices=["on", "off", "status"])
 	mountParser.set_defaults(handler=_cmdMount)
 
+	compactParser: argparse.ArgumentParser = sub.add_parser(
+		"compact",
+		help="Compactar o índice (VACUUM); desliga o FUSE durante a operação",
+	)
+	compactParser.set_defaults(handler=_cmdCompact)
+
+	encParser: argparse.ArgumentParser = sub.add_parser(
+		"config-encryption",
+		help="Cifrar o rclone.conf com a senha na carteira do KDE",
+	)
+	encParser.add_argument("action", choices=["on", "off", "status"])
+	encParser.set_defaults(handler=_cmdConfigEncryption)
+
+	passParser: argparse.ArgumentParser = sub.add_parser(
+		"rclone-password",
+		help="(interno) escreve a senha do rclone.conf para o RCLONE_PASSWORD_COMMAND",
+	)
+	passParser.set_defaults(handler=_cmdRclonePassword)
+
+	from fastonedrive.clionline import addOnlineCommands
+
+	addOnlineCommands(sub)
+
 	return parser
 
 
@@ -477,7 +515,14 @@ def _prepareProfile(args: argparse.Namespace) -> None:
 		"install-runner",
 		"krunner",
 		"mount",
+		"compact",
+		"config-encryption",
+		"rclone-password",
 		"status",
+		"pause",
+		"resume",
+		"sync-control",
+		"doctor",
 	):
 		return
 	if len(config.listProfiles()) == 0 and command == "settings":
@@ -853,7 +898,17 @@ def _hydrateOne(source: str, job: NotifyJob) -> str:
 
 
 def _cmdSyncPins(args: argparse.Namespace) -> int:
+	from fastonedrive.activity import setActivity
+	from fastonedrive.synccontrol import pauseReason
+
 	paths: list[str] = _syncPathArgs(args)
+	paused: str = "" if bool(getattr(args, "ignore_pause", False)) else pauseReason()
+	if paused != "":
+		# As edições ficam dirty (emblema "a sincronizar") e sobem quando a pausa acabar.
+		if config.activeProfile() is not None:
+			setActivity("paused", paused)
+		print(paused, file=sys.stderr)
+		return 0
 	if len(paths) > 0:
 		config.ensureActiveProfile()
 	elif config.activeProfile() is None:
@@ -997,6 +1052,8 @@ def _cmdFuse(args: argparse.Namespace) -> int:
 
 def _cmdLink(args: argparse.Namespace) -> int:
 	for source in [str(item) for item in args.sources]:
+		if _isKioHelpOrSearch(source):
+			continue
 		remote: str = toRemotePath(source)
 		if bool(args.notify):
 			url: str = runNotified(
@@ -1018,6 +1075,8 @@ def _linkOne(remote: str, job: NotifyJob) -> str:
 
 def _cmdFreeSpace(args: argparse.Namespace) -> int:
 	for source in [str(item) for item in args.sources]:
+		if _isKioHelpOrSearch(source):
+			continue
 		if bool(args.notify):
 			written: str = runNotified(
 				"Fast-OneDrive",
@@ -1204,6 +1263,70 @@ def _cmdMount(args: argparse.Namespace) -> int:
 		return 0
 	setMountEnabled(action == "on")
 	print(f"mount Fast-OneDrive: {action}")
+	return 0
+
+
+def _cmdConfigEncryption(args: argparse.Namespace) -> int:
+	from fastonedrive import secretconf
+
+	action: str = str(args.action)
+	if action == "on":
+		secretconf.enable()
+		print(f"rclone.conf cifrado; a senha está na carteira ({config.rcloneConfigPath()})")
+	elif action == "off":
+		secretconf.disable()
+		print("rclone.conf sem cifra")
+	else:
+		print("cifrado" if secretconf.isEncrypted() else "sem cifra")
+	return 0
+
+
+def _cmdRclonePassword(args: argparse.Namespace) -> int:
+	from fastonedrive import secretconf
+
+	# Com RCLONE_PASSWORD_CHANGE=1 o rclone pede a senha nova: é a que já está na
+	# carteira (enable() guarda-a antes).
+	print(secretconf.readPassword())
+	return 0
+
+
+def _cmdCompact(args: argparse.Namespace) -> int:
+	"""VACUUM de cada índice. Com o FUSE ligado, os seus commits esperavam o VACUUM e
+	podiam falhar: desliga-se a montagem, compacta-se e volta a ligar."""
+	import sqlite3
+	from pathlib import Path
+
+	from fastonedrive.index import connectDb
+	from fastonedrive.mount import fastMountActive, setMountEnabled
+
+	profiles: list[config.Profile] = config.listProfiles()
+	wasActive: bool = False
+	for profile in profiles:
+		config.activateProfile(profile.id)
+		wasActive = wasActive or fastMountActive()
+	if wasActive:
+		setMountEnabled(False)
+	try:
+		targets: list[config.Profile | None] = list(profiles) if len(profiles) > 0 else [None]
+		for target in targets:
+			if target is not None:
+				config.activateProfile(target.id)
+			dbFile: Path = config.dbPath()
+			if not dbFile.is_file():
+				continue
+			before: int = dbFile.stat().st_size
+			connection: sqlite3.Connection = connectDb()
+			try:
+				connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+				connection.execute("VACUUM")
+			finally:
+				connection.close()
+			after: int = dbFile.stat().st_size
+			label: str = target.name if target is not None else "índice"
+			print(f"{label}: {before / 1048576:.0f} MB → {after / 1048576:.0f} MB")
+	finally:
+		if wasActive:
+			setMountEnabled(True)
 	return 0
 
 
