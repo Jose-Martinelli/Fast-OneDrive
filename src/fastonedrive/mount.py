@@ -42,6 +42,18 @@ def fuseMountReady() -> bool:
 	return False
 
 
+def fuseItemPath(itemPath: str) -> Path | None:
+	"""Caminho do item na pasta FUSE (~/OneDrive) do perfil activo, se o mount estiver pronto.
+
+	É o local "oficial" para o utilizador: abrir, localizar ou copiar por aqui mantém
+	as edições no OneDrive. fastonedrive:/… e pinned/cache ficam só como recurso.
+	"""
+	if not fuseMountReady():
+		return None
+	mount: Path = config.mountPath()
+	return mount / itemPath if itemPath != "" else mount
+
+
 def applyMount() -> None:
 	config.ensureUserConfig()
 	config.ensureRcloneConfig()

@@ -213,6 +213,12 @@ QString FastOneDriveWorker::cliBin() const
 QString FastOneDriveWorker::takeProfile(const QString &path)
 {
 	m_profileId.clear();
+	// "fastonedrive:/p/" chega aqui como "/p" (StripTrailingSlash): é o
+	// contentor dos perfis, não um item chamado "p". Trata-o como a raiz
+	// para que o stat dos antepassados (Dolphin, diálogos, apps) não falhe.
+	if (path == QStringLiteral("/p")) {
+		return QStringLiteral("/");
+	}
 	if (!path.startsWith(QStringLiteral("/p/"))) {
 		return path;
 	}

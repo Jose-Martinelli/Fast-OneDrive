@@ -13,7 +13,7 @@ from fastonedrive import FastOneDriveError
 from fastonedrive import config
 from fastonedrive.hydrate import hydrateRemote
 from fastonedrive.index import indexProgress, startBackgroundIndex
-from fastonedrive.mount import applyMount, fastMountActive, fuseMountReady, legacyMountActive
+from fastonedrive.mount import applyMount, fastMountActive, fuseItemPath, fuseMountReady, legacyMountActive
 from fastonedrive.activity import readActivity, readHistory
 from fastonedrive.rclone import listRemoteNames, probeRemote, rcloneVersion, remoteAbout
 from fastonedrive.search import rowToDict, search
@@ -1313,8 +1313,12 @@ def runSettingsWindow(startHidden: bool = False) -> int:
 				return
 			entry: dict[str, Any] = entries[0]
 			try:
+				fusePath: Path | None = fuseItemPath(str(entry["path"]))
 				if bool(entry["isDir"]):
-					_spawnDolphin([_kioItemUrl(str(entry["path"]))])
+					_spawnDolphin([str(fusePath) if fusePath is not None else _kioItemUrl(str(entry["path"]))])
+					return
+				if fusePath is not None:
+					_spawnOpen(fusePath)
 					return
 				localPath: str = str(entry.get("localPath") or "")
 				if localPath != "" and Path(localPath).exists():
@@ -1710,6 +1714,9 @@ def _kioItemUrl(itemPath: str) -> str:
 def _clipboardUrl(entry: dict[str, Any]) -> Any:
 	from PyQt6.QtCore import QUrl
 
+	fusePath: Path | None = fuseItemPath(str(entry["path"]))
+	if fusePath is not None:
+		return QUrl.fromLocalFile(str(fusePath))
 	localPath: str = str(entry.get("localPath") or "")
 	if localPath != "" and Path(localPath).exists():
 		return QUrl.fromLocalFile(localPath)
@@ -1717,6 +1724,13 @@ def _clipboardUrl(entry: dict[str, Any]) -> Any:
 
 
 def _locateEntry(entry: dict[str, Any]) -> None:
+	fusePath: Path | None = fuseItemPath(str(entry["path"]))
+	if fusePath is not None:
+		if bool(entry["isDir"]):
+			_spawnDolphin([str(fusePath)])
+		else:
+			_spawnDolphin(["--select", str(fusePath)])
+		return
 	localPath: str = str(entry.get("localPath") or "")
 	if localPath != "" and Path(localPath).exists():
 		_spawnDolphin(["--select", localPath])

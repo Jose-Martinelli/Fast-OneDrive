@@ -9,7 +9,7 @@ from fastonedrive import FastOneDriveError
 from fastonedrive import config
 from fastonedrive.menus import repoBinPath, writeInstalledText
 from fastonedrive.hydrate import hydrateRemote
-from fastonedrive.mount import fuseMountReady
+from fastonedrive.mount import fuseItemPath, fuseMountReady
 from fastonedrive.notify import notify
 from fastonedrive.search import pinnedLocalPath, rowToDict, search
 
@@ -110,13 +110,20 @@ def runMatch(matchId: str, actionId: str, activationToken: str = "") -> None:
 
 
 def openIndexedPath(itemPath: str, activationToken: str = "") -> None:
+	fusePath: Path | None = fuseItemPath(itemPath)
 	if itemPath == "":
+		if fusePath is not None:
+			_openLocal(fusePath, activationToken, "dolphin")
+			return
 		_openDolphinUrl(_profileRootUrl(), activationToken)
 		return
 	entry = _entry(itemPath)
 	if entry is None:
 		raise FastOneDriveError(f"item não encontrado no índice: {itemPath}")
 	data: dict[str, Any] = rowToDict(entry)
+	if fusePath is not None:
+		_openLocal(fusePath, activationToken, "dolphin" if bool(data["isDir"]) else "xdg-open")
+		return
 	if bool(data["pinned"]) and bool(data["isDir"]):
 		local: Path = pinnedLocalPath(itemPath)
 		if local.exists():
